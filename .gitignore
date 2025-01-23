@@ -1,4 +1,9 @@
 env.yml
 transcription.txt
+<<<<<<< HEAD
 rec.mp3
 lection.mp3
+=======
+lection.mp3
+rec.mp3
+>>>>>>> b842bae3e712f325aeb76367a44d671922d54d5a
