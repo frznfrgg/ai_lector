@@ -8,7 +8,6 @@ from gigachat.models import Chat, Messages, MessagesRole
 from pyannote.audio import Pipeline
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-
 STOP_WORDS_PATH = "stop_words.txt"
 PYANNOTE_AUTH_TOKEN = ""
 ABSTRACT_PROMPT = "Сделай конспект по тексту"
@@ -30,153 +29,122 @@ class LectureHelper:
         else:
             print(f"Warning! audio_path {audio_path} does not exist")
 
-        #       список из пар вида ["спикер", время речи]
-        self.diogram = None
-        #       сырой текст лекции
-        self.lecture_text = None
-        #       текст конспекта
-        self.abstract_text = None
-        #       доля стоп слов в процентах
-        self.stop_words_rate = None
-        #       список с кол-вом слов в секунду
-        self.words_per_second = None
-        #       список с кол-вом слов сказанных суммарно к моменту времени
-        self.words_counter = None
-        #       среднее число слов в секунду
-        self.avg_words_speed = None
-        #       самое большое число слов с секунду
-        self.max_words_speed = None
-        #       момент времени с наибольшим числом слов в сек
-        self.time_of_top_speed = None
-        #       строка в которой лежат вопросы к лекции
-        self.questions = None
-        #       список с фрагметами текста по временным отрезкам
-        self.chunks = None
-        #       список из пар 10 самых популярных слов и их частоты
-        self.top_words = None
-        #       список с тройками вида ("спикер", начало, конец)
-        self.labeled_chunks = None
-        #       моменты времени с известными значениями кол-ва слов (выступают в роли абсциссы для графиков)
-        self.seconds = None
+        # stores attributes with already assigned values
+        self._cache = {}
 
-    def get_lecture_text(self) -> str:
-        if self.lecture_text is None:
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    def __getattr__(self, name):
+        computations = {
+            "diagram": self._set_stat,
+            "lecture_text": self._set_lecture_text,
+            "abstract_text": self._set_abstract_text,
+            "stop_words_rate": self._set_stop_words_rate,
+            "words_per_second": self._set_words_per_second,
+            "words_counter": self._set_words_counter,
+            "avg_words_speed": self._set_avg_words_speed,
+            "max_words_speed": self._set_max_words_speed,
+            "time_of_top_speed": self._set_time_of_top_speed,
+            "questions": self._set_abstract_text,
+            "chunks": self._set_lecture_text,
+            "top_words": self._set_top_words,
+            "labeled_chunks": self._set_stat,
+            "seconds": self._set_words_counter,
+        }
 
-            model_id = "openai/whisper-large-v3"
+        if name in computations:
+            if name not in self._cache:  # Compute and store only if not already set
+                self._cache[name] = computations[name]()
+            return self._cache[name]
 
-            model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_id,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
-            )
-            model.to(device)
+        raise AttributeError(
+            f"'{self.__class__.__name__}' object has no attribute '{name}'"
+        )
 
-            processor = AutoProcessor.from_pretrained(model_id)
+    def set_lecture_text(self) -> str:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-            pipe = pipeline(
-                "automatic-speech-recognition",
-                model=model,
-                tokenizer=processor.tokenizer,
-                feature_extractor=processor.feature_extractor,
-                torch_dtype=torch_dtype,
-                device=device,
-            )
+        model_id = "openai/whisper-large-v3"
 
-            result = pipe(
-                inputs=self.audio_path,
-                generate_kwargs={"language": "russian"},
-                return_timestamps=True,
-            )
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        )
+        model.to(device)
 
-            self.lecture_text = result["text"]
-            self.chunks = result["chunks"]
+        processor = AutoProcessor.from_pretrained(model_id)
 
-        else:
-            pass
+        pipe = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
 
-        return self.lecture_text
+        result = pipe(
+            inputs=self.audio_path,
+            generate_kwargs={"language": "russian"},
+            return_timestamps=True,
+        )
 
-    def get_abstract_text(self) -> str:
-        if self.abstract_text is None:
-            payload = Chat(
-                messages=[
-                    Messages(
-                        role=MessagesRole.SYSTEM,
-                        content="Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения",
-                    )
-                ],
-                temperature=0.3,
-            )
-            with GigaChat(credentials=self.api_key, verify_ssl_certs=False) as giga:
-                payload.messages.append(
-                    Messages(
-                        role=MessagesRole.USER,
-                        content=f"{ABSTRACT_PROMPT}: [{self.lecture_text}]",
-                    )
+        self.lecture_text = result["text"]
+        self.chunks = result["chunks"]
+
+    def set_abstract_text(self) -> str:
+        payload = Chat(
+            messages=[
+                Messages(
+                    role=MessagesRole.SYSTEM,
+                    content="Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения",
                 )
-                response = giga.chat(payload)
-                payload.messages.append(response.choices[0].message)
-                self.abstract_text = response.choices[0].message.content
-
-                payload.messages.append(
-                    Messages(role=MessagesRole.USER, content=QUESTIONS_PROMPT)
+            ],
+            temperature=0.3,
+        )
+        with GigaChat(credentials=self.api_key, verify_ssl_certs=False) as giga:
+            payload.messages.append(
+                Messages(
+                    role=MessagesRole.USER,
+                    content=f"{ABSTRACT_PROMPT}: [{self.lecture_text}]",
                 )
-                response = giga.chat(payload)
-                payload.messages.append(response.choices[0].message)
-                self.questions = response.choices[0].message.content
-        else:
-            pass
+            )
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            self.abstract_text = response.choices[0].message.content
 
-        return self.abstract_text
+            payload.messages.append(
+                Messages(role=MessagesRole.USER, content=QUESTIONS_PROMPT)
+            )
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            self.questions = response.choices[0].message.content
 
-    def get_questions(self) -> str:
-        if self.questions is None:
-            _ = self.get_abstract_text()
-        else:
-            pass
-        return self.questions
+    def set_top_words(self) -> List[Tuple[int, str]]:
+        lst_no = [".", ",", ":", "!", '"', "'", "[", "]", "-", "—", "(", ")"]
+        lst = []
 
-    def get_top_words(self) -> List[Tuple[int, str]]:
-        if self.top_words is None:
-            lst_no = [".", ",", ":", "!", '"', "'", "[", "]", "-", "—", "(", ")"]
-            lst = []
+        for word in self.lecture_text.lower().split():
+            if word not in lst_no:
+                _word = word
+                if word[-1] in lst_no:
+                    _word = _word[:-1]
+                if word[0] in lst_no:
+                    _word = _word[1:]
+                lst.append(_word)
 
-            for word in self.lecture_text.lower().split():
-                if word not in lst_no:
-                    _word = word
-                    if word[-1] in lst_no:
-                        _word = _word[:-1]
-                    if word[0] in lst_no:
-                        _word = _word[1:]
-                    lst.append(_word)
+        _dict = dict()
+        for word in lst:
+            _dict[word] = _dict.get(word, 0) + 1
 
-            _dict = dict()
-            for word in lst:
-                _dict[word] = _dict.get(word, 0) + 1
+        # сортируем словарь посредством формирования списка (значение, ключ)
+        _list = []
+        for key, value in _dict.items():
+            _list.append((value, key))
+            _list.sort(reverse=True)
 
-            # сортируем словарь посредством формирования списка (значение, ключ)
-            _list = []
-            for key, value in _dict.items():
-                _list.append((value, key))
-                _list.sort(reverse=True)
-
-            self.top_words = _list[0:10]
-
-        else:
-            pass
-
-        return self.top_words
-
-    def get_diogram(self) -> List:
-        if self.diogram is None:
-            self._get_stat()
-        else:
-            pass
-
-        return self.diogram
+        self.top_words = _list[0:10]
 
     def _fill_silence_intervals(
         self,
@@ -196,7 +164,7 @@ class LectureHelper:
                     filled_data.append(["Silence", end, next_start])
         return filled_data
 
-    def _get_stat(self):
+    def set_stat(self):
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=PYANNOTE_AUTH_TOKEN,
@@ -235,59 +203,41 @@ class LectureHelper:
         ]
         self.labeled_chunks = self._fill_silence_intervals(timestamps_of_speakers)
 
-    def get_labeled_chunks(self) -> List[Tuple[str, float, float]]:
-        if self.labeled_chunks is None:
-            self._get_stat()
-        else:
-            pass
+    def set_stop_words_rate(self) -> int:
+        with open(STOP_WORDS_PATH) as f:
+            stop_words = set(f.read().splitlines())
 
-        return self.labeled_chunks
+        preproc_text_list = [
+            word for word in self.lecture_text.split() if word in stop_words
+        ]
 
-    def get_stop_words_rate(self) -> int:
-        if self.stop_words_rate is None:
-            with open(STOP_WORDS_PATH) as f:
-                stop_words = set(f.read().splitlines())
-
-            preproc_text_list = [
-                word for word in self.lecture_text.split() if word in stop_words
-            ]
-
-            self.stop_words_rate = int(
-                len(preproc_text_list) / len(self.lecture_text.split()) * 100.0
-            )
-        else:
-            pass
-
-        return self.stop_words_rate
+        self.stop_words_rate = int(
+            len(preproc_text_list) / len(self.lecture_text.split()) * 100.0
+        )
 
     #   возвращает пару списков Х и У для построения графика слов сказанных за все время
-    def get_words_counter(self) -> Tuple[List[int]]:
-        if self.words_counter is None or self.seconds is None:
-            seconds = [0]
-            words_counter = [0]
-            previous_end = 0
+    def set_words_counter(self) -> Tuple[List[int]]:
+        seconds = [0]
+        words_counter = [0]
+        previous_end = 0
 
-            if self.chunks is None:
-                _ = self.get_lecture_text()
-            else:
-                pass
-
-            for line in self.chunks:
-                start, end = line["timestamp"]
-                text = line["text"]
-                if end >= previous_end:
-                    seconds.append(seconds[-1] + end - previous_end)
-                else:
-                    seconds.append(seconds[-1] + 30 - previous_end)
-                words_counter.append(words_counter[-1] + len(text.split()))
-                previous_end = end
-
-            self.words_counter = words_counter
-            self.seconds = seconds
+        if self.chunks is None:
+            _ = self.set_lecture_text()
         else:
             pass
 
-        return self.seconds, self.words_counter
+        for line in self.chunks:
+            start, end = line["timestamp"]
+            text = line["text"]
+            if end >= previous_end:
+                seconds.append(seconds[-1] + end - previous_end)
+            else:
+                seconds.append(seconds[-1] + 30 - previous_end)
+            words_counter.append(words_counter[-1] + len(text.split()))
+            previous_end = end
+
+        self.words_counter = words_counter
+        self.seconds = seconds
 
     def _gaussian_smoothing(self, array: np.ndarray, degree=5) -> np.array:
         """Applies gaussian smoothing of chosen degree to the array.
@@ -336,56 +286,14 @@ class LectureHelper:
 
         return derivative
 
-    def get_words_per_second(self) -> Tuple[List]:
-        if self.words_per_second is None:
-            if self.seconds is None or self.words_counter is None:
-                _, _ = self.get_words_counter()
-            else:
-                pass
+    def set_words_per_second(self) -> Tuple[List]:
+        self.words_per_second = self._calculate_derivative().tolist()
 
-            self.words_per_second = self._calculate_derivative().tolist()
-        else:
-            pass
+    def set_avg_words_speed(self) -> float:
+        self.avg_words_speed = float(np.mean(self.words_per_second))
 
-        return self.seconds, self.words_per_second
+    def set_max_words_speed(self) -> float:
+        self.max_words_speed = float(np.max(self.words_per_second))
 
-    def get_avg_words_speed(self) -> float:
-        if self.avg_words_speed is None:
-            if self.words_per_second is None:
-                _, _ = self.get_words_per_second()
-            else:
-                pass
-
-            self.avg_words_speed = float(np.mean(self.words_per_second))
-        else:
-            pass
-
-        return self.avg_words_speed
-
-    def get_max_words_speed(self) -> float:
-        if self.max_words_speed is None:
-            if self.words_per_second is None:
-                _, _ = self.get_words_per_second()
-            else:
-                pass
-
-            self.max_words_speed = float(np.max(self.words_per_second))
-        else:
-            pass
-
-        return self.max_words_speed
-
-    def get_time_of_top_speed(self) -> float:
-        if self.time_of_top_speed is None:
-            if self.words_per_second is None:
-                _, _ = self.get_words_per_second()
-            else:
-                pass
-
-            self.time_of_top_speed = float(
-                self.seconds[np.argmax(self.words_per_second)]
-            )
-        else:
-            pass
-
-        return self.time_of_top_speed
+    def set_time_of_top_speed(self) -> float:
+        self.time_of_top_speed = float(self.seconds[np.argmax(self.words_per_second)])
