@@ -9,25 +9,23 @@ from pyannote.audio import Pipeline
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 STOP_WORDS_PATH = "stop_words.txt"
-PYANNOTE_AUTH_TOKEN = ""
+
+# store api keys as env variable
+PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_API_KEY")  # get it at huggingface
+GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY")  # get it at gigachat api
 ABSTRACT_PROMPT = "Сделай конспект по тексту"
 QUESTIONS_PROMPT = "Приведи 4 вопроса для самопроверки по материалу этого же текста"
 
 
 class LectureHelper:
-    def __init__(self, audio_path: str, api_key_path: str = "api.txt"):
-        self.api_key = None
-        if os.path.exists(api_key_path):
-            with open(api_key_path) as f:
-                self.api_key = f.readline()
-        else:
-            print(f"Warning! api_key file was not found in {api_key_path}")
-
+    def __init__(self, audio_path: str, gigachat_api_key: str, pyannote_api_key: str):
+        self.gigachat_api_key = gigachat_api_key
+        self.pyannote_api_key = pyannote_api_key
         self.audio_path = None
         if os.path.exists(audio_path):
             self.audio_path = audio_path
         else:
-            print(f"Warning! audio_path {audio_path} does not exist")
+            raise FileNotFoundError(f"Audio_path {audio_path} does not exist")
 
         # stores attributes with already assigned values
         self._cache = {}
@@ -103,7 +101,7 @@ class LectureHelper:
             ],
             temperature=0.3,
         )
-        with GigaChat(credentials=self.api_key, verify_ssl_certs=False) as giga:
+        with GigaChat(credentials=self.gigachat_api_key, verify_ssl_certs=False) as giga:
             payload.messages.append(
                 Messages(
                     role=MessagesRole.USER,
@@ -167,7 +165,7 @@ class LectureHelper:
     def set_stat(self):
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=PYANNOTE_AUTH_TOKEN,
+            use_auth_token=self.pyannote_api_key,
         ).to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
 
         diarization = pipeline(file=self.audio_path)
