@@ -8,34 +8,67 @@ from gigachat.models import Chat, Messages, MessagesRole
 from pyannote.audio import Pipeline
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-STOP_WORDS_PATH = "stop_words.txt"
+# store api keys as env variable and access them like in example below:
+# PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_API_KEY") - get it at huggingface
+# GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY") - get it at gigachat api
 
-# store api keys as env variable
-PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_API_KEY")  # get it at huggingface
-GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY")  # get it at gigachat api
+STOPWORDS_PATH = "stopwords.txt"
 ABSTRACT_PROMPT = "Сделай конспект по тексту"
 QUESTIONS_PROMPT = "Приведи 4 вопроса для самопроверки по материалу этого же текста"
 
 
 class LectureHelper:
-    def __init__(self, audio_path: str, gigachat_api_key: str, pyannote_api_key: str):
+    """Audio recording analyzer class.
+    NOTE: All attributes that correspond to metrics are stored in _cache, which is used to provide lazy initialization functionality
+
+    Attributes:
+        _cache (dict): Stores calculated metrics
+    Attributes stored in _cache:
+        lecture_text (str): Full text of lection
+        abstract_text (str): Summarized text of lection
+        diagram (List[Tuple[str, float]]): Statistics for pie chart representing active time for each speaker
+        stopwords_rate (int): percentage of stopwords
+        words_per_second (Tuple[List[int]]):
+        words_counter (str):
+        avg_words_speed (str):
+        max_words_speed (str):
+        time_of_top_speed (str):
+        questions (str):
+        chunks (str):
+        top_words (str):
+        labeled_chunks (str):
+        seconds (str):
+    """
+
+    def __init__(
+        self, recording_path: str, gigachat_api_key: str, pyannote_api_key: str
+    ):
+        """Initializes an analyzer object.
+
+        Args:
+            recording_path (str): path to file with the necessary audio file
+            gigachat_api_key (str): secret api key for accessing GigaChat api service
+            pyannote_api_key (str): secret api key for accessing pyannote model from Huggingface
+
+        Raises:
+            FileNotFoundError: raised if path to the file could not be found
+        """
         self.gigachat_api_key = gigachat_api_key
         self.pyannote_api_key = pyannote_api_key
-        self.audio_path = None
-        if os.path.exists(audio_path):
-            self.audio_path = audio_path
+        if os.path.exists(recording_path):
+            self.recording_path = recording_path
         else:
-            raise FileNotFoundError(f"Audio_path {audio_path} does not exist")
+            raise FileNotFoundError(f"Audio_path {recording_path} does not exist")
 
         # stores attributes with already assigned values
         self._cache = {}
 
     def __getattr__(self, name):
         computations = {
-            "diagram": self._set_stat,
             "lecture_text": self._set_lecture_text,
             "abstract_text": self._set_abstract_text,
-            "stop_words_rate": self._set_stop_words_rate,
+            "diagram": self._set_stat,
+            "stopwords_rate": self._set_stopwords_rate,
             "words_per_second": self._set_words_per_second,
             "words_counter": self._set_words_counter,
             "avg_words_speed": self._set_avg_words_speed,
@@ -50,14 +83,14 @@ class LectureHelper:
 
         if name in computations:
             if name not in self._cache:  # Compute and store only if not already set
-                self._cache[name] = computations[name]()
+                computations[name]()
             return self._cache[name]
 
         raise AttributeError(
             f"'{self.__class__.__name__}' object has no attribute '{name}'"
         )
 
-    def set_lecture_text(self) -> str:
+    def _set_lecture_text(self):
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -83,15 +116,15 @@ class LectureHelper:
         )
 
         result = pipe(
-            inputs=self.audio_path,
+            inputs=self.recording_path,
             generate_kwargs={"language": "russian"},
             return_timestamps=True,
         )
 
-        self.lecture_text = result["text"]
-        self.chunks = result["chunks"]
+        self._cache["lecture_text"] = result["text"]
+        self._cache["chunks"] = result["chunks"]
 
-    def set_abstract_text(self) -> str:
+    def _set_abstract_text(self):
         payload = Chat(
             messages=[
                 Messages(
@@ -101,7 +134,9 @@ class LectureHelper:
             ],
             temperature=0.3,
         )
-        with GigaChat(credentials=self.gigachat_api_key, verify_ssl_certs=False) as giga:
+        with GigaChat(
+            credentials=self.gigachat_api_key, verify_ssl_certs=False
+        ) as giga:
             payload.messages.append(
                 Messages(
                     role=MessagesRole.USER,
@@ -117,9 +152,9 @@ class LectureHelper:
             )
             response = giga.chat(payload)
             payload.messages.append(response.choices[0].message)
-            self.questions = response.choices[0].message.content
+            self._cache["questions"] = response.choices[0].message.content
 
-    def set_top_words(self) -> List[Tuple[int, str]]:
+    def _set_top_words(self) -> List[Tuple[int, str]]:
         lst_no = [".", ",", ":", "!", '"', "'", "[", "]", "-", "—", "(", ")"]
         lst = []
 
@@ -136,13 +171,12 @@ class LectureHelper:
         for word in lst:
             _dict[word] = _dict.get(word, 0) + 1
 
-        # сортируем словарь посредством формирования списка (значение, ключ)
         _list = []
         for key, value in _dict.items():
             _list.append((value, key))
             _list.sort(reverse=True)
 
-        self.top_words = _list[0:10]
+        self._cache["top_words"] = _list[0:10]
 
     def _fill_silence_intervals(
         self,
@@ -162,13 +196,13 @@ class LectureHelper:
                     filled_data.append(["Silence", end, next_start])
         return filled_data
 
-    def set_stat(self):
+    def _set_stat(self):
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=self.pyannote_api_key,
         ).to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
 
-        diarization = pipeline(file=self.audio_path)
+        diarization = pipeline(file=self.recording_path)
 
         time_allocation = diarization.chart()
         t_lecturer = time_allocation[0][1]
@@ -194,33 +228,34 @@ class LectureHelper:
             else:
                 timestamps_of_speakers[i][0] = "Audience"
 
-        self.diogram = [
+        self._cache["diagram"] = [
             ["Lecturer", t_lecturer],
             ["Audience", t_audience],
             ["Silence", t_silence],
         ]
-        self.labeled_chunks = self._fill_silence_intervals(timestamps_of_speakers)
+        self._cache["labeled_chunks"] = self._fill_silence_intervals(
+            timestamps_of_speakers
+        )
 
-    def set_stop_words_rate(self) -> int:
-        with open(STOP_WORDS_PATH) as f:
-            stop_words = set(f.read().splitlines())
+    def _set_stopwords_rate(self):
+        with open(STOPWORDS_PATH) as f:
+            stopwords = set(f.read().splitlines())
 
         preproc_text_list = [
-            word for word in self.lecture_text.split() if word in stop_words
+            word for word in self.lecture_text.split() if word in stopwords
         ]
 
-        self.stop_words_rate = int(
+        self._cache["stopwords_rate"] = int(
             len(preproc_text_list) / len(self.lecture_text.split()) * 100.0
         )
 
-    #   возвращает пару списков Х и У для построения графика слов сказанных за все время
-    def set_words_counter(self) -> Tuple[List[int]]:
+    def _set_words_counter(self) -> Tuple[List[int]]:
         seconds = [0]
         words_counter = [0]
         previous_end = 0
 
         if self.chunks is None:
-            _ = self.set_lecture_text()
+            _ = self._set_lecture_text()
         else:
             pass
 
@@ -234,8 +269,8 @@ class LectureHelper:
             words_counter.append(words_counter[-1] + len(text.split()))
             previous_end = end
 
-        self.words_counter = words_counter
-        self.seconds = seconds
+        self._cache["words_counter"] = words_counter
+        self._cache["seconds"] = seconds
 
     def _gaussian_smoothing(self, array: np.ndarray, degree=5) -> np.array:
         """Applies gaussian smoothing of chosen degree to the array.
@@ -284,14 +319,16 @@ class LectureHelper:
 
         return derivative
 
-    def set_words_per_second(self) -> Tuple[List]:
-        self.words_per_second = self._calculate_derivative().tolist()
+    def _set_words_per_second(self):
+        self._cache["words_per_second"] = self._calculate_derivative().tolist()
 
-    def set_avg_words_speed(self) -> float:
-        self.avg_words_speed = float(np.mean(self.words_per_second))
+    def _set_avg_words_speed(self) -> float:
+        self._cache["avg_words_speed"] = float(np.mean(self.words_per_second))
 
-    def set_max_words_speed(self) -> float:
-        self.max_words_speed = float(np.max(self.words_per_second))
+    def _set_max_words_speed(self) -> float:
+        self._cache["max_words_speed"] = float(np.max(self.words_per_second))
 
-    def set_time_of_top_speed(self) -> float:
-        self.time_of_top_speed = float(self.seconds[np.argmax(self.words_per_second)])
+    def _set_time_of_top_speed(self) -> float:
+        self._cache["time_of_top_speed"] = float(
+            self.seconds[np.argmax(self.words_per_second)]
+        )
