@@ -19,7 +19,7 @@ QUESTIONS_PROMPT = "Приведи 4 вопроса для самопровер�
 
 class LectureHelper:
     """Audio recording analyzer class.
-    NOTE: All attributes that correspond to metrics are stored in _cache, which is used to provide lazy initialization functionality
+    NOTE: All attributes that correspond to metrics are stored in _cache, which is used to provide lazy initialization functionality.
 
     Attributes:
         _cache (dict): Stores calculated metrics
@@ -27,17 +27,17 @@ class LectureHelper:
         lecture_text (str): Full text of lection
         abstract_text (str): Summarized text of lection
         diagram (List[Tuple[str, float]]): Statistics for pie chart representing active time for each speaker
-        stopwords_rate (int): percentage of stopwords
-        words_per_second (Tuple[List[int]]):
-        words_counter (str):
-        avg_words_speed (str):
-        max_words_speed (str):
-        time_of_top_speed (str):
-        questions (str):
-        chunks (str):
-        top_words (str):
-        labeled_chunks (str):
-        seconds (str):
+        stopwords_rate (int): Percentage of stopwords
+        words_per_second (List[float]): Statistics graph showing how fast the words were spoken
+        words_counter (List[int]): Statistics of how many words were spoken by each timestamp
+        avg_words_speed (float): Average speed of speech
+        max_words_speed (float): Maximal speed of speech
+        time_of_top_speed (float): Time (in seconds) when speech was the fastest
+        questions (str): Generated questions for lection
+        chunks (List[dict]]): Full text of lection splitted in chunks. Each item in list consists of a timestamp and a text
+        top_words (List[Tuple[int, str]]): List of the most popular words and number of their occasions
+        labeled_chunks (List[list]): Lecture text splitted into chunks by speaker. Each item consists of speaker label, start time of chunk, end time of chunk
+        seconds (List[float]): List of timestamps in seconds. Used as an abcissa in graphs
     """
 
     def __init__(
@@ -63,7 +63,20 @@ class LectureHelper:
         # stores attributes with already assigned values
         self._cache = {}
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str):
+        """Method that is raised when the attribute is called.
+        Used to provide lazy initialization functionality:
+        metrics are calculated only when the atribute is called for the first time.
+
+        Args:
+            name (str): name of an attribute to reach
+
+        Raises:
+            AttributeError: raised only if the attribute doesn't exist (metric is not specified)
+
+        Returns:
+            Metric corresponding to the attribute
+        """
         computations = {
             "lecture_text": self._set_lecture_text,
             "abstract_text": self._set_abstract_text,
@@ -91,6 +104,7 @@ class LectureHelper:
         )
 
     def _set_lecture_text(self):
+        """Creates transcription of the recording and text of the lection splitted into chunks."""
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -125,6 +139,7 @@ class LectureHelper:
         self._cache["chunks"] = result["chunks"]
 
     def _set_abstract_text(self):
+        """Creates summarized text of the lection and questions for lection."""
         payload = Chat(
             messages=[
                 Messages(
@@ -154,7 +169,8 @@ class LectureHelper:
             payload.messages.append(response.choices[0].message)
             self._cache["questions"] = response.choices[0].message.content
 
-    def _set_top_words(self) -> List[Tuple[int, str]]:
+    def _set_top_words(self):
+        """Calculates the most common words."""
         lst_no = [".", ",", ":", "!", '"', "'", "[", "]", "-", "—", "(", ")"]
         lst = []
 
@@ -197,6 +213,7 @@ class LectureHelper:
         return filled_data
 
     def _set_stat(self):
+        """Calculates statistics for diagram, and creates chunks labeled by speaker."""
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=self.pyannote_api_key,
@@ -238,6 +255,7 @@ class LectureHelper:
         )
 
     def _set_stopwords_rate(self):
+        """Calculates percentage of stopwords."""
         with open(STOPWORDS_PATH) as f:
             stopwords = set(f.read().splitlines())
 
@@ -249,7 +267,8 @@ class LectureHelper:
             len(preproc_text_list) / len(self.lecture_text.split()) * 100.0
         )
 
-    def _set_words_counter(self) -> Tuple[List[int]]:
+    def _set_words_counter(self):
+        """Calculates a total amount of words spoken by the certain time and timestamps in seconds."""
         seconds = [0]
         words_counter = [0]
         previous_end = 0
@@ -274,13 +293,14 @@ class LectureHelper:
 
     def _gaussian_smoothing(self, array: np.ndarray, degree=5) -> np.array:
         """Applies gaussian smoothing of chosen degree to the array.
+        Used in calculating derivative method.
 
         Args:
             array (np.ndarray): The array to smooth.
             degree (int, optional): The degree (strength) of smoothing. Defaults to 5.
 
         Returns:
-            np.array: Smoothed array
+            np.array: Smoothed array.
         """
         myarray = np.pad(array, (degree - 1, degree - 1), mode="edge")
         window = degree * 2 - 1
@@ -301,9 +321,9 @@ class LectureHelper:
         """Calculates the derivative of y with respect of x.
 
         Args:
-            max_limit (int, optional): If provided, imits the max value of the derivative. Defaults to 7.
-            smoothing (str, optional): If provided, specifies the type of smoothing to use. Defaults to "gaussian".
-            smooth_degree (int, optional): Sets degree of smoothing. Defaults to 20.
+            max_limit (int, optional): If provided, imits the max value of the derivative. Defaults to 7
+            smoothing (str, optional): If provided, specifies the type of smoothing to use. Defaults to "gaussian"
+            smooth_degree (int, optional): Sets degree of smoothing. Defaults to 20
 
         Returns:
             np.ndarray: the values of calculated derivative
@@ -320,15 +340,19 @@ class LectureHelper:
         return derivative
 
     def _set_words_per_second(self):
+        """Calculates speed of speech at each timestamp."""
         self._cache["words_per_second"] = self._calculate_derivative().tolist()
 
-    def _set_avg_words_speed(self) -> float:
+    def _set_avg_words_speed(self):
+        """Calculates average speed of speech."""
         self._cache["avg_words_speed"] = float(np.mean(self.words_per_second))
 
-    def _set_max_words_speed(self) -> float:
+    def _set_max_words_speed(self):
+        """Calculates max speed of speech."""
         self._cache["max_words_speed"] = float(np.max(self.words_per_second))
 
-    def _set_time_of_top_speed(self) -> float:
+    def _set_time_of_top_speed(self):
+        """Finds a timestamp when speech was the fastest."""
         self._cache["time_of_top_speed"] = float(
             self.seconds[np.argmax(self.words_per_second)]
         )
