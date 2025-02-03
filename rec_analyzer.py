@@ -15,6 +15,8 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 STOPWORDS_PATH = "stopwords.txt"
 ABSTRACT_PROMPT = "Сделай конспект по тексту"
 QUESTIONS_PROMPT = "Приведи 4 вопроса для самопроверки по материалу этого же текста"
+TREE_PROMPT = 'По этому же тексту создай дерево знаний в формате json. Вот пример того, что у тебя должно получитьтся: \nconst jsonData = {\n"title":"Лекция по математическому анализу",\n"nodes":[\n{\n"id":"матанализ", "label":"Математический анализ", "children":[...]\n}\n]\n};'
+
 
 
 class LectureHelper:
@@ -92,6 +94,7 @@ class LectureHelper:
             "top_words": self._set_top_words,
             "labeled_chunks": self._set_stat,
             "seconds": self._set_words_counter,
+            "mind_map": self._set_abstract_text,
         }
 
         if name in computations:
@@ -160,14 +163,23 @@ class LectureHelper:
             )
             response = giga.chat(payload)
             payload.messages.append(response.choices[0].message)
-            self.abstract_text = response.choices[0].message.content
+            self._cache["abstract_text"] = response.choices[0].message.content
 
+            # запрос на создание 4 вопросов
             payload.messages.append(
                 Messages(role=MessagesRole.USER, content=QUESTIONS_PROMPT)
             )
             response = giga.chat(payload)
             payload.messages.append(response.choices[0].message)
             self._cache["questions"] = response.choices[0].message.content
+
+            # запрос на дерево знаний
+            payload.messages.append(
+                Messages(role=MessagesRole.USER, content=TREE_PROMPT)
+            )
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            self._cache["mind_map"] = response.choices[0].message.content
 
     def _set_top_words(self):
         """Calculates the most common words."""
