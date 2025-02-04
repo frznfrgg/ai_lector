@@ -1,6 +1,7 @@
 import os
 from typing import List, Tuple
 
+import json
 import numpy as np
 import torch
 from gigachat import GigaChat
@@ -9,11 +10,12 @@ from pyannote.audio import Pipeline
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 # store api keys as env variable and access them like in example below:
-# PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_API_KEY") - get it at huggingface
-# GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY") - get it at gigachat api
+# PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_API_KEY")
+# GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY")
 
 STOPWORDS_PATH = "stopwords.txt"
-ABSTRACT_PROMPT = "Сделай конспект по тексту"
+ROLE_PROMPT      = "Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения"
+ABSTRACT_PROMPT  = "Сделай конспект по тексту"
 QUESTIONS_PROMPT = "Приведи 4 вопроса для самопроверки по материалу этого же текста"
 TREE_PROMPT = 'По этому же тексту создай дерево знаний в формате json. Вот пример того, что у тебя должно получитьтся: \nconst jsonData = {\n"title":"Лекция по математическому анализу",\n"nodes":[\n{\n"id":"матанализ", "label":"Математический анализ", "children":[...]\n}\n]\n};'
 
@@ -43,7 +45,7 @@ class LectureHelper:
     """
 
     def __init__(
-        self, recording_path: str, gigachat_api_key: str, pyannote_api_key: str
+        self, recording_path: str, gigachat_api_key: str = GIGACHAT_API_KEY, pyannote_api_key: str = PYANNOTE_AUTH_TOKEN
     ):
         """Initializes an analyzer object.
 
@@ -65,21 +67,7 @@ class LectureHelper:
         # stores attributes with already assigned values
         self._cache = {}
 
-    def __getattr__(self, name: str):
-        """Method that is raised when the attribute is called.
-        Used to provide lazy initialization functionality:
-        metrics are calculated only when the atribute is called for the first time.
-
-        Args:
-            name (str): name of an attribute to reach
-
-        Raises:
-            AttributeError: raised only if the attribute doesn't exist (metric is not specified)
-
-        Returns:
-            Metric corresponding to the attribute
-        """
-        computations = {
+        self.computations = {
             "lecture_text": self._set_lecture_text,
             "abstract_text": self._set_abstract_text,
             "diagram": self._set_stat,
@@ -97,7 +85,23 @@ class LectureHelper:
             "mind_map": self._set_abstract_text,
         }
 
-        if name in computations:
+
+    def __getattr__(self, name: str):
+        """Method that is raised when the attribute is called.
+        Used to provide lazy initialization functionality:
+        metrics are calculated only when the atribute is called for the first time.
+
+        Args:
+            name (str): name of an attribute to reach
+
+        Raises:
+            AttributeError: raised only if the attribute doesn't exist (metric is not specified)
+
+        Returns:
+            Metric corresponding to the attribute
+        """
+
+        if name in self.computations:
             if name not in self._cache:  # Compute and store only if not already set
                 computations[name]()
             return self._cache[name]
@@ -105,6 +109,26 @@ class LectureHelper:
         raise AttributeError(
             f"'{self.__class__.__name__}' object has no attribute '{name}'"
         )
+
+    def get_results(self):
+        """json format of some attributes"""
+
+        return json.dumps( {
+            "lecture_text":self.__getattr__("lecture_text"),
+            "abstract_text":self.__getattr__("abstract_text"),
+            # словарь имеет вид {ВРЕМЯ, Х, У}. В примере вид был {ВРЕМЯ, У}
+            "speech_speed":self._get_speech_speed(),
+            # Надо протестировать, с этим точно будут проблемы
+            "mindmap":self.__getattr__("mind_map"),
+            # только один словарь с топ 10 слов. Что за второй словарь в примере - не понятно
+            "popular_words":self.__getattr__("top_words"),
+            "conversation_static":self.__getattr__("diagram"),
+
+            # у нас такого функцианала в принципе нет...
+            "lecture_timeline":self._get_lecture_timeline(),
+
+            "questions":self.__getattr__("questions")
+        },default=str)
 
     def _set_lecture_text(self):
         """Creates transcription of the recording and text of the lection splitted into chunks."""
@@ -146,8 +170,8 @@ class LectureHelper:
         payload = Chat(
             messages=[
                 Messages(
-                    role=MessagesRole.SYSTEM,
-                    content="Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения",
+                    role=MessagesRole.SYSTEM, 
+                    content=ROLE_PROMPT,
                 )
             ],
             temperature=0.3,
@@ -158,7 +182,7 @@ class LectureHelper:
             payload.messages.append(
                 Messages(
                     role=MessagesRole.USER,
-                    content=f"{ABSTRACT_PROMPT}: [{self.lecture_text}]",
+                    content=f"{ABSTRACT_PROMPT}: [{self.__getattr__('lecture_text')}]",
                 )
             )
             response = giga.chat(payload)
@@ -186,7 +210,7 @@ class LectureHelper:
         lst_no = [".", ",", ":", "!", '"', "'", "[", "]", "-", "—", "(", ")"]
         lst = []
 
-        for word in self.lecture_text.lower().split():
+        for word in self.__getattr__('lecture_text').lower().split():
             if word not in lst_no:
                 _word = word
                 if word[-1] in lst_no:
@@ -202,9 +226,13 @@ class LectureHelper:
         _list = []
         for key, value in _dict.items():
             _list.append((value, key))
-            _list.sort(reverse=True)
+        _list.sort(reverse=True)
 
-        self._cache["top_words"] = _list[0:10]
+        _dict = dict()
+        for value, key in _list[0:10]:
+            _dict[key] = value
+
+        self._cache["top_words"] = _dict
 
     def _fill_silence_intervals(
         self,
@@ -257,11 +285,13 @@ class LectureHelper:
             else:
                 timestamps_of_speakers[i][0] = "Audience"
 
-        self._cache["diagram"] = [
-            ["Lecturer", t_lecturer],
-            ["Audience", t_audience],
-            ["Silence", t_silence],
-        ]
+        time_of_events = t_lecturer + t_audience + t_silence
+
+        self._cache["diagram"] = {
+            "lecturer": t_lecturer/time_of_events*100.0,
+            "discussion": t_audience/time_of_events*100.0,
+            "quiet": t_silence/time_of_events*100.0
+        }
         self._cache["labeled_chunks"] = self._fill_silence_intervals(
             timestamps_of_speakers
         )
@@ -272,11 +302,11 @@ class LectureHelper:
             stopwords = set(f.read().splitlines())
 
         preproc_text_list = [
-            word for word in self.lecture_text.split() if word in stopwords
+            word for word in self.__getattr__('lecture_text').split() if word in stopwords
         ]
 
         self._cache["stopwords_rate"] = int(
-            len(preproc_text_list) / len(self.lecture_text.split()) * 100.0
+            len(preproc_text_list) / len(self.__getattr__('lecture_text').split()) * 100.0
         )
 
     def _set_words_counter(self):
@@ -285,12 +315,7 @@ class LectureHelper:
         words_counter = [0]
         previous_end = 0
 
-        if self.chunks is None:
-            _ = self._set_lecture_text()
-        else:
-            pass
-
-        for line in self.chunks:
+        for line in self.__getattr__("chunks"):
             start, end = line["timestamp"]
             text = line["text"]
             if end >= previous_end:
@@ -341,7 +366,7 @@ class LectureHelper:
             np.ndarray: the values of calculated derivative
         """
 
-        derivative = np.gradient(self.words_counter, self.seconds)
+        derivative = np.gradient(self.__getattr__("words_counter"), self.__getattr__("seconds"))
         if max_limit:
             derivative[derivative >= max_limit] = max_limit
         derivative = np.nan_to_num(derivative, nan=np.nanmean(derivative))
@@ -366,5 +391,12 @@ class LectureHelper:
     def _set_time_of_top_speed(self):
         """Finds a timestamp when speech was the fastest."""
         self._cache["time_of_top_speed"] = float(
-            self.seconds[np.argmax(self.words_per_second)]
+            self._cache["seconds"][np.argmax(self.words_per_second)]
         )
+
+    def _get_speech_speed(self):
+        return {
+            'lecture_time': self.__getattr__("seconds")[-1],
+            'time_frames': self.__getattr__("seconds"),
+            'speed': self.__getattr__("words_per_second")
+        }
