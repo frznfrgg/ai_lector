@@ -1,9 +1,11 @@
+import json
 import os
+from collections import Counter
 from typing import List, Tuple
 
-import json
 import numpy as np
 import torch
+import torchaudio
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 from pyannote.audio import Pipeline
@@ -14,11 +16,10 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 # GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY")
 
 STOPWORDS_PATH = "stopwords.txt"
-ROLE_PROMPT      = "Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения"
-ABSTRACT_PROMPT  = "Сделай конспект по тексту"
+ROLE_PROMPT = "Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения"
+ABSTRACT_PROMPT = "Сделай конспект по тексту"
 QUESTIONS_PROMPT = "Приведи 4 вопроса для самопроверки по материалу этого же текста"
-TREE_PROMPT = 'По этому же тексту создай дерево знаний в формате json. Вот пример того, что у тебя должно получитьтся: \nconst jsonData = {\n"title":"Лекция по математическому анализу",\n"nodes":[\n{\n"id":"матанализ", "label":"Математический анализ", "children":[...]\n}\n]\n};'
-
+TREE_PROMPT = 'По этому же тексту создай подробное дерево знаний в формате json. Вот пример того, что у тебя должно получитьтся: \nconst jsonData = {\n"title":"Лекция по математическому анализу",\n"nodes":[\n{\n"id":"матанализ", "label":"Математический анализ", "children":[...]\n}\n]\n};. Даже если дерево получится маленьким, все равно создай его. В ответ отправь только json, не пиши ничего больще.'
 
 
 class LectureHelper:
@@ -45,7 +46,7 @@ class LectureHelper:
     """
 
     def __init__(
-        self, recording_path: str, gigachat_api_key: str = GIGACHAT_API_KEY, pyannote_api_key: str = PYANNOTE_AUTH_TOKEN
+        self, recording_path: str, gigachat_api_key: str, pyannote_api_key: str
     ):
         """Initializes an analyzer object.
 
@@ -57,6 +58,8 @@ class LectureHelper:
         Raises:
             FileNotFoundError: raised if path to the file could not be found
         """
+        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.gigachat_api_key = gigachat_api_key
         self.pyannote_api_key = pyannote_api_key
         if os.path.exists(recording_path):
@@ -74,17 +77,15 @@ class LectureHelper:
             "stopwords_rate": self._set_stopwords_rate,
             "words_per_second": self._set_words_per_second,
             "words_counter": self._set_words_counter,
-            "avg_words_speed": self._set_avg_words_speed,
-            "max_words_speed": self._set_max_words_speed,
-            "time_of_top_speed": self._set_time_of_top_speed,
             "questions": self._set_abstract_text,
             "chunks": self._set_lecture_text,
-            "top_words": self._set_top_words,
             "labeled_chunks": self._set_stat,
             "seconds": self._set_words_counter,
             "mind_map": self._set_abstract_text,
+            "transcripted_chunks": self._set_transcripted_chunks,
+            "speed": self._set_speech_speed,
+            "popular_words": self._set_popular_words,
         }
-
 
     def __getattr__(self, name: str):
         """Method that is raised when the attribute is called.
@@ -103,7 +104,7 @@ class LectureHelper:
 
         if name in self.computations:
             if name not in self._cache:  # Compute and store only if not already set
-                computations[name]()
+                self.computations[name]()
             return self._cache[name]
 
         raise AttributeError(
@@ -111,66 +112,36 @@ class LectureHelper:
         )
 
     def get_results(self):
-        """json format of some attributes"""
+        """Json format of some attributes"""
 
-        return json.dumps( {
-            "lecture_text":self.__getattr__("lecture_text"),
-            "abstract_text":self.__getattr__("abstract_text"),
-            # словарь имеет вид {ВРЕМЯ, Х, У}. В примере вид был {ВРЕМЯ, У}
-            "speech_speed":self._get_speech_speed(),
-            # Надо протестировать, с этим точно будут проблемы
-            "mindmap":self.__getattr__("mind_map"),
-            # только один словарь с топ 10 слов. Что за второй словарь в примере - не понятно
-            "popular_words":self.__getattr__("top_words"),
-            "conversation_static":self.__getattr__("diagram"),
-
-            # у нас такого функцианала в принципе нет...
-            "lecture_timeline":self._get_lecture_timeline(),
-
-            "questions":self.__getattr__("questions")
-        },default=str)
+        return json.dumps(
+            {
+                "lecture_text": self.lecture_text,
+                "abstract_text": self.abstract_text,
+                "speech_speed": self.speed,
+                "mindmap": self.mind_map,
+                "popular_words": self.popular_words,
+                "conversation_static": self.diagram,
+                "lecture_timeline": self.transcripted_chunks,
+                "questions": self.questions,
+            },
+            default=str
+        )
 
     def _set_lecture_text(self):
         """Creates transcription of the recording and text of the lection splitted into chunks."""
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        lecture_text = ""
+        for _, text, _ in self.transcripted_chunks:
+            lecture_text += text
 
-        model_id = "openai/whisper-large-v3"
-
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=True,
-        )
-        model.to(device)
-
-        processor = AutoProcessor.from_pretrained(model_id)
-
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            torch_dtype=torch_dtype,
-            device=device,
-        )
-
-        result = pipe(
-            inputs=self.recording_path,
-            generate_kwargs={"language": "russian"},
-            return_timestamps=True,
-        )
-
-        self._cache["lecture_text"] = result["text"]
-        self._cache["chunks"] = result["chunks"]
+        self._cache["lecture_text"] = lecture_text
 
     def _set_abstract_text(self):
         """Creates summarized text of the lection and questions for lection."""
         payload = Chat(
             messages=[
                 Messages(
-                    role=MessagesRole.SYSTEM, 
+                    role=MessagesRole.SYSTEM,
                     content=ROLE_PROMPT,
                 )
             ],
@@ -182,7 +153,7 @@ class LectureHelper:
             payload.messages.append(
                 Messages(
                     role=MessagesRole.USER,
-                    content=f"{ABSTRACT_PROMPT}: [{self.__getattr__('lecture_text')}]",
+                    content=f"{ABSTRACT_PROMPT}: [{self.lecture_text}]",
                 )
             )
             response = giga.chat(payload)
@@ -205,34 +176,30 @@ class LectureHelper:
             payload.messages.append(response.choices[0].message)
             self._cache["mind_map"] = response.choices[0].message.content
 
-    def _set_top_words(self):
+    def _set_popular_words(self):
         """Calculates the most common words."""
-        lst_no = [".", ",", ":", "!", '"', "'", "[", "]", "-", "—", "(", ")"]
-        lst = []
+        with open(STOPWORDS_PATH) as f:
+            stopwords = set(f.read().splitlines())
+        words = {"lector": [], "audience": []}
 
-        for word in self.__getattr__('lecture_text').lower().split():
-            if word not in lst_no:
-                _word = word
-                if word[-1] in lst_no:
-                    _word = _word[:-1]
-                if word[0] in lst_no:
-                    _word = _word[1:]
-                lst.append(_word)
+        for speaker, text, _ in self.transcripted_chunks:
+            speaker = speaker.lower()
+            if speaker != "silence":
+                words[speaker].extend(
+                    [
+                        word
+                        for word in text.lower().split()
+                        if word not in stopwords and word.isalpha()
+                    ]
+                )
+        word_counts_lector = Counter(words["lector"])
+        word_counts_audience = Counter(words["audience"])
+        popular_words = [
+            word_counts_lector.most_common()[:10],
+            word_counts_audience.most_common()[:10],
+        ]
 
-        _dict = dict()
-        for word in lst:
-            _dict[word] = _dict.get(word, 0) + 1
-
-        _list = []
-        for key, value in _dict.items():
-            _list.append((value, key))
-        _list.sort(reverse=True)
-
-        _dict = dict()
-        for value, key in _list[0:10]:
-            _dict[key] = value
-
-        self._cache["top_words"] = _dict
+        self._cache["popular_words"] = popular_words
 
     def _fill_silence_intervals(
         self,
@@ -288,9 +255,9 @@ class LectureHelper:
         time_of_events = t_lecturer + t_audience + t_silence
 
         self._cache["diagram"] = {
-            "lecturer": t_lecturer/time_of_events*100.0,
-            "discussion": t_audience/time_of_events*100.0,
-            "quiet": t_silence/time_of_events*100.0
+            "lecturer": t_lecturer / time_of_events * 100.0,
+            "discussion": t_audience / time_of_events * 100.0,
+            "quiet": t_silence / time_of_events * 100.0,
         }
         self._cache["labeled_chunks"] = self._fill_silence_intervals(
             timestamps_of_speakers
@@ -302,31 +269,27 @@ class LectureHelper:
             stopwords = set(f.read().splitlines())
 
         preproc_text_list = [
-            word for word in self.__getattr__('lecture_text').split() if word in stopwords
+            word
+            for word in self.lecture_text.split()
+            if word in stopwords
         ]
 
         self._cache["stopwords_rate"] = int(
-            len(preproc_text_list) / len(self.__getattr__('lecture_text').split()) * 100.0
+            len(preproc_text_list)
+            / len(self.lecture_text.split())
+            * 100.0
         )
 
     def _set_words_counter(self):
         """Calculates a total amount of words spoken by the certain time and timestamps in seconds."""
+        word_counter = [0]
         seconds = [0]
-        words_counter = [0]
-        previous_end = 0
-
-        for line in self.__getattr__("chunks"):
-            start, end = line["timestamp"]
-            text = line["text"]
-            if end >= previous_end:
-                seconds.append(seconds[-1] + end - previous_end)
-            else:
-                seconds.append(seconds[-1] + 30 - previous_end)
-            words_counter.append(words_counter[-1] + len(text.split()))
-            previous_end = end
-
-        self._cache["words_counter"] = words_counter
-        self._cache["seconds"] = seconds
+        for _, text, timestamps in self.transcripted_chunks:
+            start, end = timestamps
+            word_counter.append(word_counter[-1] + len(text.split()))
+            seconds.append(end)
+        self._cache["words_counter"] = word_counter[1:]
+        self._cache["seconds"] = seconds[1:]
 
     def _gaussian_smoothing(self, array: np.ndarray, degree=5) -> np.array:
         """Applies gaussian smoothing of chosen degree to the array.
@@ -351,6 +314,8 @@ class LectureHelper:
 
     def _calculate_derivative(
         self,
+        x,
+        y,
         max_limit=7,
         smoothing="gaussian",
         smooth_degree=20,
@@ -358,6 +323,8 @@ class LectureHelper:
         """Calculates the derivative of y with respect of x.
 
         Args:
+            x (int): Sequence of tics on x axis
+            y (int): Sequence of values on y axis
             max_limit (int, optional): If provided, imits the max value of the derivative. Defaults to 7
             smoothing (str, optional): If provided, specifies the type of smoothing to use. Defaults to "gaussian"
             smooth_degree (int, optional): Sets degree of smoothing. Defaults to 20
@@ -366,7 +333,7 @@ class LectureHelper:
             np.ndarray: the values of calculated derivative
         """
 
-        derivative = np.gradient(self.__getattr__("words_counter"), self.__getattr__("seconds"))
+        derivative = np.gradient(y, x)
         if max_limit:
             derivative[derivative >= max_limit] = max_limit
         derivative = np.nan_to_num(derivative, nan=np.nanmean(derivative))
@@ -378,25 +345,86 @@ class LectureHelper:
 
     def _set_words_per_second(self):
         """Calculates speed of speech at each timestamp."""
-        self._cache["words_per_second"] = self._calculate_derivative().tolist()
+        words_per_second = {}
+        for words, seconds in zip(self.words_counter, self.seconds):
+            words_per_second[words] = seconds
+        
+        self._cache["words_per_second"] = self._calculate_derivative(
+            sorted(list(words_per_second.values())), sorted(list(words_per_second.keys()))
+        ).tolist()
 
-    def _set_avg_words_speed(self):
-        """Calculates average speed of speech."""
-        self._cache["avg_words_speed"] = float(np.mean(self.words_per_second))
+    def _set_speech_speed(self):
+        speed = dict(zip(self.seconds, self.words_per_second))
+        self._cache["speed"] = speed
 
-    def _set_max_words_speed(self):
-        """Calculates max speed of speech."""
-        self._cache["max_words_speed"] = float(np.max(self.words_per_second))
+    def _set_transcripted_chunks(self):
+        transcripted_chunks = []
 
-    def _set_time_of_top_speed(self):
-        """Finds a timestamp when speech was the fastest."""
-        self._cache["time_of_top_speed"] = float(
-            self._cache["seconds"][np.argmax(self.words_per_second)]
+        model_id = "openai/whisper-large-v3"
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            torch_dtype=self.torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
         )
+        model.to(self.device)
 
-    def _get_speech_speed(self):
-        return {
-            'lecture_time': self.__getattr__("seconds")[-1],
-            'time_frames': self.__getattr__("seconds"),
-            'speed': self.__getattr__("words_per_second")
-        }
+        processor = AutoProcessor.from_pretrained(model_id)
+        speech_recognition_pipe = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            torch_dtype=self.torch_dtype,
+            device=self.device,
+        )
+        waveform, orig_sample_rate = torchaudio.load(self.recording_path)
+
+        for speaker, start, end in self.labeled_chunks:
+            start_sample = int(start * orig_sample_rate)
+            end_sample = int(end * orig_sample_rate)
+            fragment = waveform[:, start_sample:end_sample]
+
+            # convert to mono if necessary (whisper expects mono audio)
+            if fragment.shape[0] > 1:
+                fragment = fragment.mean(dim=0, keepdim=True)
+
+            # remove channel dimension (now shape: [1, samples] -> [samples])
+            fragment = fragment.squeeze(0)
+            fragment_np = fragment.numpy()
+
+            # ensure the sampling rate matches what the feature extractor expects
+            target_sample_rate = processor.feature_extractor.sampling_rate
+            if orig_sample_rate != target_sample_rate:
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=orig_sample_rate, new_freq=target_sample_rate
+                )
+                fragment_resampled = resampler(fragment.unsqueeze(0))
+                fragment_resampled = fragment_resampled.squeeze(0)
+                fragment_np = fragment_resampled.numpy()
+
+            if speaker != "Silence":
+                text = speech_recognition_pipe(
+                    inputs=fragment_np,
+                    generate_kwargs={"language": "russian"},
+                    return_timestamps=True,
+                )["text"]
+            else:
+                text = ""
+
+            if (
+                speaker == "Silence"
+                or text.strip() == ""
+                or text == " Продолжение следует..."
+            ):
+                text = ""
+                speaker = "Silence"
+            else:
+                text = speech_recognition_pipe(
+                    inputs=fragment_np,
+                    generate_kwargs={"language": "russian"},
+                    return_timestamps=True,
+                )["text"]
+
+            transcripted_chunks.append([speaker, text, (start, end)])
+        self._cache["transcripted_chunks"] = transcripted_chunks

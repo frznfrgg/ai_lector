@@ -7,3 +7,5 @@ api.txt
 .ipynb_checkpoints/texter test-checkpoint.ipynb
 __pycache__
 test.py
+assistant.py
+test.ipynb
