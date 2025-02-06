@@ -18,8 +18,8 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 STOPWORDS_PATH = "stopwords.txt"
 ROLE_PROMPT = "Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения"
 ABSTRACT_PROMPT = "Сделай конспект по тексту"
-QUESTIONS_PROMPT = "Приведи 4 вопроса для самопроверки по материалу этого же текста"
-TREE_PROMPT = 'По этому же тексту создай подробное дерево знаний в формате json. Вот пример того, что у тебя должно получитьтся: \nconst jsonData = {\n"title":"Лекция по математическому анализу",\n"nodes":[\n{\n"id":"матанализ", "label":"Математический анализ", "children":[...]\n}\n]\n};. Даже если дерево получится маленьким, все равно создай его. В ответ отправь только json, не пиши ничего больще.'
+QUESTIONS_PROMPT = "Приведи 7 вопросов для самопроверки по материалу этого же текста"
+TREE_PROMPT = 'Создай по этому же тексту подробное дерево знаний. В дереве ость только одна главная тема, которая содержит другие микротемы. Результат верни в формате JSON-массива без каких-либо пояснений, например, {id: "название текста", topic: "Название текста", children: [{id: "название микротемы", topic: "Название микротемы", children:[{id: "название микротемы", topic: "Название микротемы", children: []}]}]}.'
 
 
 class LectureHelper:
@@ -33,7 +33,7 @@ class LectureHelper:
         abstract_text (str): Summarized text of lection
         diagram (List[Tuple[str, float]]): Statistics for pie chart representing active time for each speaker
         stopwords_rate (int): Percentage of stopwords
-        words_per_second (List[float]): Statistics graph showing how fast the words were spoken
+        syllables_per_second (List[float]): Statistics graph showing how fast the words were spoken
         words_counter (List[int]): Statistics of how many words were spoken by each timestamp
         avg_words_speed (float): Average speed of speech
         max_words_speed (float): Maximal speed of speech
@@ -74,8 +74,7 @@ class LectureHelper:
             "lecture_text": self._set_lecture_text,
             "abstract_text": self._set_abstract_text,
             "diagram": self._set_stat,
-            "stopwords_rate": self._set_stopwords_rate,
-            "words_per_second": self._set_words_per_second,
+            "syllables_per_second": self._set_syllables_per_second,
             "words_counter": self._set_words_counter,
             "questions": self._set_abstract_text,
             "chunks": self._set_lecture_text,
@@ -85,6 +84,7 @@ class LectureHelper:
             "transcripted_chunks": self._set_transcripted_chunks,
             "speed": self._set_speech_speed,
             "popular_words": self._set_popular_words,
+            "_chunks": self._set_transcripted_chunks
         }
 
     def __getattr__(self, name: str):
@@ -125,13 +125,13 @@ class LectureHelper:
                 "lecture_timeline": self.transcripted_chunks,
                 "questions": self.questions,
             },
-            default=str
+            default=str,
         )
 
     def _set_lecture_text(self):
         """Creates transcription of the recording and text of the lection splitted into chunks."""
         lecture_text = ""
-        for _, text, _ in self.transcripted_chunks:
+        for _, text, _ in self._chunks:
             lecture_text += text
 
         self._cache["lecture_text"] = lecture_text
@@ -174,17 +174,20 @@ class LectureHelper:
             )
             response = giga.chat(payload)
             payload.messages.append(response.choices[0].message)
-            self._cache["mind_map"] = response.choices[0].message.content
+            mindmap = response.choices[0].message.content
+            mindmap = json.loads(mindmap)
+            mindmap = json.dumps(mindmap[0], indent=4, ensure_ascii=False)
+            self._cache["mind_map"] = mindmap
 
     def _set_popular_words(self):
         """Calculates the most common words."""
         with open(STOPWORDS_PATH) as f:
             stopwords = set(f.read().splitlines())
-        words = {"lector": [], "audience": []}
+        words = {1: [], 2: []}
 
-        for speaker, text, _ in self.transcripted_chunks:
-            speaker = speaker.lower()
-            if speaker != "silence":
+        for speaker, text, _ in self._chunks:
+            # if not silence
+            if speaker != 3:
                 words[speaker].extend(
                     [
                         word
@@ -192,11 +195,11 @@ class LectureHelper:
                         if word not in stopwords and word.isalpha()
                     ]
                 )
-        word_counts_lector = Counter(words["lector"])
-        word_counts_audience = Counter(words["audience"])
+        word_counts_lector = Counter(words[1])
+        word_counts_audience = Counter(words[2])
         popular_words = [
-            word_counts_lector.most_common()[:10],
-            word_counts_audience.most_common()[:10],
+            dict(word_counts_audience.most_common()[:10]),
+            dict(word_counts_lector.most_common()[:10]),
         ]
 
         self._cache["popular_words"] = popular_words
@@ -263,102 +266,43 @@ class LectureHelper:
             timestamps_of_speakers
         )
 
-    def _set_stopwords_rate(self):
-        """Calculates percentage of stopwords."""
-        with open(STOPWORDS_PATH) as f:
-            stopwords = set(f.read().splitlines())
-
-        preproc_text_list = [
-            word
-            for word in self.lecture_text.split()
-            if word in stopwords
-        ]
-
-        self._cache["stopwords_rate"] = int(
-            len(preproc_text_list)
-            / len(self.lecture_text.split())
-            * 100.0
-        )
-
     def _set_words_counter(self):
         """Calculates a total amount of words spoken by the certain time and timestamps in seconds."""
         word_counter = [0]
         seconds = [0]
-        for _, text, timestamps in self.transcripted_chunks:
+        for _, text, timestamps in self._chunks:
             start, end = timestamps
             word_counter.append(word_counter[-1] + len(text.split()))
             seconds.append(end)
         self._cache["words_counter"] = word_counter[1:]
         self._cache["seconds"] = seconds[1:]
 
-    def _gaussian_smoothing(self, array: np.ndarray, degree=5) -> np.array:
-        """Applies gaussian smoothing of chosen degree to the array.
-        Used in calculating derivative method.
-
-        Args:
-            array (np.ndarray): The array to smooth.
-            degree (int, optional): The degree (strength) of smoothing. Defaults to 5.
-
-        Returns:
-            np.array: Smoothed array.
-        """
-        myarray = np.pad(array, (degree - 1, degree - 1), mode="edge")
-        window = degree * 2 - 1
-
-        weight = np.arange(-degree + 1, degree) / window
-        weight = np.exp(-(16 * weight**2))
-        weight /= weight.sum()
-
-        smoothed = np.convolve(myarray, weight, mode="valid")
-        return smoothed
-
-    def _calculate_derivative(
-        self,
-        x,
-        y,
-        max_limit=7,
-        smoothing="gaussian",
-        smooth_degree=20,
-    ) -> np.ndarray:
-        """Calculates the derivative of y with respect of x.
-
-        Args:
-            x (int): Sequence of tics on x axis
-            y (int): Sequence of values on y axis
-            max_limit (int, optional): If provided, imits the max value of the derivative. Defaults to 7
-            smoothing (str, optional): If provided, specifies the type of smoothing to use. Defaults to "gaussian"
-            smooth_degree (int, optional): Sets degree of smoothing. Defaults to 20
-
-        Returns:
-            np.ndarray: the values of calculated derivative
-        """
-
-        derivative = np.gradient(y, x)
-        if max_limit:
-            derivative[derivative >= max_limit] = max_limit
-        derivative = np.nan_to_num(derivative, nan=np.nanmean(derivative))
-
-        if smoothing == "gaussian":
-            derivative = self._gaussian_smoothing(derivative, degree=smooth_degree)
-
-        return derivative
-
-    def _set_words_per_second(self):
+    def _set_syllables_per_second(self):
         """Calculates speed of speech at each timestamp."""
-        words_per_second = {}
-        for words, seconds in zip(self.words_counter, self.seconds):
-            words_per_second[words] = seconds
-        
-        self._cache["words_per_second"] = self._calculate_derivative(
-            sorted(list(words_per_second.values())), sorted(list(words_per_second.keys()))
+        vowels = ["а", "и", "о", "у", "ы", "э"]
+        total_syllables = 0
+        syllables_per_second = {}
+        for speaker, text, timestamp in self._chunks:
+            if speaker != 3:
+                _, end = timestamp
+                end = end // 60
+                if end not in syllables_per_second.keys():
+                    syllables_per_second[end] = 0
+                total_syllables += sum(text.count(vowel) for vowel in vowels)
+                syllables_per_second[end] = total_syllables
+        self._cache["syllables_per_second"] = np.gradient(
+            list(syllables_per_second.values()), list(syllables_per_second.keys())
         ).tolist()
 
     def _set_speech_speed(self):
-        speed = dict(zip(self.seconds, self.words_per_second))
+        minutes = sorted(list(set([second // 60 for second in self.seconds])))
+        speed = dict(zip(minutes, self.syllables_per_second))
         self._cache["speed"] = speed
 
     def _set_transcripted_chunks(self):
+        _chunks = []
         transcripted_chunks = []
+        speaker_to_id = {"Lector": 1, "Audience": 2, "Silence": 3}
 
         model_id = "openai/whisper-large-v3"
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -426,5 +370,11 @@ class LectureHelper:
                     return_timestamps=True,
                 )["text"]
 
-            transcripted_chunks.append([speaker, text, (start, end)])
+            transcripted_chunks.append(
+                [speaker_to_id[speaker], text, f"{int(start // 60)}:{int(start % 60)}"]
+            )
+            _chunks.append(
+                [speaker_to_id[speaker], text, (start, end)]
+            )
         self._cache["transcripted_chunks"] = transcripted_chunks
+        self._cache["_chunks"] = _chunks
