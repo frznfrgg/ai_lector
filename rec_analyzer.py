@@ -46,7 +46,7 @@ class LectureHelper:
     """
 
     def __init__(
-        self, recording_path: str, gigachat_api_key: str, pyannote_api_key: str
+        self, recording_path: str, gigachat_api_key: str, pyannote_api_key: str, recordId: str
     ):
         """Initializes an analyzer object.
 
@@ -58,6 +58,8 @@ class LectureHelper:
         Raises:
             FileNotFoundError: raised if path to the file could not be found
         """
+        self.recordId = recordId
+
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.gigachat_api_key = gigachat_api_key
