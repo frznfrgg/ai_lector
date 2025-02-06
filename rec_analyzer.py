@@ -19,7 +19,18 @@ STOPWORDS_PATH = "stopwords.txt"
 ROLE_PROMPT = "Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения"
 ABSTRACT_PROMPT = "Сделай конспект по тексту"
 QUESTIONS_PROMPT = "Приведи 7 вопросов для самопроверки по материалу этого же текста"
-TREE_PROMPT = 'Создай по этому же тексту подробное дерево знаний. В дереве ость только одна главная тема, которая содержит другие микротемы. Результат верни в формате JSON-массива без каких-либо пояснений, например, {id: "название текста", topic: "Название текста", children: [{id: "название микротемы", topic: "Название микротемы", children:[{id: "название микротемы", topic: "Название микротемы", children: []}]}]}.'
+TREE_PROMPT = 'Создай по этому же тексту подробное дерево знаний. Придерживайся следующих правил: \
+    В дереве ость только одна главная тема, которая содержит другие микротемы. \
+    Дерево знаний должно быть глубоким, содержать много микротем. \
+    Описание каждой темы должны состоять из словосочетаний или очень коротких предложений \
+    У каждой темы обязательно должны быть поля id, topic и children. \
+    Результат верни в формате JSON-массива без каких-либо пояснений, например: \
+    {"id": "название текста", "topic": "Название текста", "children": [{"id": "название микротемы", "topic": "Название микротемы", "children":[{"id": "название микротемы", "topic": "Название микротемы", "children": []}]}]}.'
+MOOD_PROMPT = "По этому же тексту оцени общее настроение \
+    Придерживайся следующий правил: \
+    Результ верни в виде строки, содержащей словосочетание или короткое предложение, описывающее лекцию. \
+    Используй разные эпитеты чтобы точнее передать атмосферу на лекции \
+    Например: 'Интересно и полезно' или 'увлекательно и сложно' или 'скучно и непонятно'."
 
 
 class LectureHelper:
@@ -31,22 +42,23 @@ class LectureHelper:
     Attributes stored in _cache:
         lecture_text (str): Full text of lection
         abstract_text (str): Summarized text of lection
-        diagram (List[Tuple[str, float]]): Statistics for pie chart representing active time for each speaker
-        stopwords_rate (int): Percentage of stopwords
-        syllables_per_second (List[float]): Statistics graph showing how fast the words were spoken
-        words_counter (List[int]): Statistics of how many words were spoken by each timestamp
-        avg_words_speed (float): Average speed of speech
-        max_words_speed (float): Maximal speed of speech
-        time_of_top_speed (float): Time (in seconds) when speech was the fastest
         questions (str): Generated questions for lection
-        chunks (List[dict]]): Full text of lection splitted in chunks. Each item in list consists of a timestamp and a text
-        top_words (List[Tuple[int, str]]): List of the most popular words and number of their occasions
-        labeled_chunks (List[list]): Lecture text splitted into chunks by speaker. Each item consists of speaker label, start time of chunk, end time of chunk
-        seconds (List[float]): List of timestamps in seconds. Used as an abcissa in graphs
+        mind_map (str): JSON-like mindmap of lecture
+        mood (str): Overall mood of the lecture
+        popular_words (List[Dict[str, int]]): List of the most popular words and number of their occasions
+        diagram (List[Tuple[str, float]]): Statistics for pie chart representing active time for each speaker
+        syllables_per_minute (List[float]): Speed of speach in syllables/min
+        speed (Dict[int, int]): Speed of speech at each minute
+        chunks (List[dict]]): Full text of lection splitted in chunks. Each item in list consists of a speaker id, text and timestamp
+        transcripted_chunks (List[list]): Chunks in readable format
     """
 
     def __init__(
-        self, recording_path: str, gigachat_api_key: str, pyannote_api_key: str, recordId: str
+        self,
+        recording_path: str,
+        gigachat_api_key: str,
+        pyannote_api_key: str,
+        recordId: str,
     ):
         """Initializes an analyzer object.
 
@@ -59,7 +71,6 @@ class LectureHelper:
             FileNotFoundError: raised if path to the file could not be found
         """
         self.recordId = recordId
-
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.gigachat_api_key = gigachat_api_key
@@ -74,19 +85,17 @@ class LectureHelper:
 
         self.computations = {
             "lecture_text": self._set_lecture_text,
-            "abstract_text": self._set_abstract_text,
+            "abstract_text": self._gigachat_analyze,
+            "questions": self._gigachat_analyze,
+            "mind_map": self._gigachat_analyze,
+            "mood": self._gigachat_analyze,
+            "popular_words": self._set_popular_words,
             "diagram": self._set_stat,
-            "syllables_per_second": self._set_syllables_per_second,
-            "words_counter": self._set_words_counter,
-            "questions": self._set_abstract_text,
-            "chunks": self._set_lecture_text,
+            "syllables_per_minute": self._set_syllables_per_minute,
+            "chunks": self._set_chunks,
             "labeled_chunks": self._set_stat,
-            "seconds": self._set_words_counter,
-            "mind_map": self._set_abstract_text,
             "transcripted_chunks": self._set_transcripted_chunks,
             "speed": self._set_speech_speed,
-            "popular_words": self._set_popular_words,
-            "_chunks": self._set_transcripted_chunks
         }
 
     def __getattr__(self, name: str):
@@ -133,13 +142,13 @@ class LectureHelper:
     def _set_lecture_text(self):
         """Creates transcription of the recording and text of the lection splitted into chunks."""
         lecture_text = ""
-        for _, text, _ in self._chunks:
+        for _, text, _ in self.chunks:
             lecture_text += text
 
         self._cache["lecture_text"] = lecture_text
 
-    def _set_abstract_text(self):
-        """Creates summarized text of the lection and questions for lection."""
+    def _gigachat_analyze(self):
+        """Analyzes text using gigachat to generate abstract of text, questions, mind map and summarized lecture mood."""
         payload = Chat(
             messages=[
                 Messages(
@@ -162,7 +171,6 @@ class LectureHelper:
             payload.messages.append(response.choices[0].message)
             self._cache["abstract_text"] = response.choices[0].message.content
 
-            # запрос на создание 4 вопросов
             payload.messages.append(
                 Messages(role=MessagesRole.USER, content=QUESTIONS_PROMPT)
             )
@@ -170,7 +178,6 @@ class LectureHelper:
             payload.messages.append(response.choices[0].message)
             self._cache["questions"] = response.choices[0].message.content
 
-            # запрос на дерево знаний
             payload.messages.append(
                 Messages(role=MessagesRole.USER, content=TREE_PROMPT)
             )
@@ -178,8 +185,15 @@ class LectureHelper:
             payload.messages.append(response.choices[0].message)
             mindmap = response.choices[0].message.content
             mindmap = json.loads(mindmap)
-            mindmap = json.dumps(mindmap[0], indent=4, ensure_ascii=False)
+            mindmap = json.dumps(mindmap, indent=4, ensure_ascii=False)
             self._cache["mind_map"] = mindmap
+
+            payload.messages.append(
+                Messages(role=MessagesRole.USER, content=MOOD_PROMPT)
+            )
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            self._cache["mood"] = response.choices[0].message.content
 
     def _set_popular_words(self):
         """Calculates the most common words."""
@@ -187,7 +201,7 @@ class LectureHelper:
             stopwords = set(f.read().splitlines())
         words = {1: [], 2: []}
 
-        for speaker, text, _ in self._chunks:
+        for speaker, text, _ in self.chunks:
             # if not silence
             if speaker != 3:
                 words[speaker].extend(
@@ -210,10 +224,11 @@ class LectureHelper:
         self,
         data: List[Tuple[str, float, float]],
     ) -> List[Tuple[str, float, float]]:
+        """Fills intervals when no words were spoken"""
         filled_data = []
 
         if data[0][1] > 0:
-            filled_data.append(["Silence", 0, data[0][1]])
+            filled_data.append([3, 0, data[0][1]])
         for i, entry in enumerate(data):
             speaker, start, end = entry
             filled_data.append(entry)
@@ -221,7 +236,7 @@ class LectureHelper:
             if i < len(data) - 1:
                 next_start = data[i + 1][1]
                 if end < next_start:
-                    filled_data.append(["Silence", end, next_start])
+                    filled_data.append([3, end, next_start])
         return filled_data
 
     def _set_stat(self):
@@ -253,9 +268,9 @@ class LectureHelper:
         lector_id = time_allocation[0][0]
         for i in range(len(timestamps_of_speakers)):
             if timestamps_of_speakers[i][0] == lector_id:
-                timestamps_of_speakers[i][0] = "Lector"
+                timestamps_of_speakers[i][0] = 1
             else:
-                timestamps_of_speakers[i][0] = "Audience"
+                timestamps_of_speakers[i][0] = 2
 
         time_of_events = t_lecturer + t_audience + t_silence
 
@@ -268,43 +283,36 @@ class LectureHelper:
             timestamps_of_speakers
         )
 
-    def _set_words_counter(self):
-        """Calculates a total amount of words spoken by the certain time and timestamps in seconds."""
-        word_counter = [0]
-        seconds = [0]
-        for _, text, timestamps in self._chunks:
-            start, end = timestamps
-            word_counter.append(word_counter[-1] + len(text.split()))
-            seconds.append(end)
-        self._cache["words_counter"] = word_counter[1:]
-        self._cache["seconds"] = seconds[1:]
-
-    def _set_syllables_per_second(self):
-        """Calculates speed of speech at each timestamp."""
-        vowels = ["а", "и", "о", "у", "ы", "э"]
+    def _set_syllables_per_minute(self):
+        """Calculates speed of speech in syllables per minute"""
+        vowels = ["а", "е", "ё", "и", "о", "у", "ы", "э", "ю", "я"]
         total_syllables = 0
-        syllables_per_second = {}
-        for speaker, text, timestamp in self._chunks:
+        syllables_per_minute = {}
+        for speaker, text, timestamp in self.chunks:
             if speaker != 3:
                 _, end = timestamp
                 end = end // 60
-                if end not in syllables_per_second.keys():
-                    syllables_per_second[end] = 0
+                if end not in syllables_per_minute.keys():
+                    syllables_per_minute[end] = 0
                 total_syllables += sum(text.count(vowel) for vowel in vowels)
-                syllables_per_second[end] = total_syllables
-        self._cache["syllables_per_second"] = np.gradient(
-            list(syllables_per_second.values()), list(syllables_per_second.keys())
+                syllables_per_minute[end] = total_syllables
+        self._cache["syllables_per_minute"] = np.gradient(
+            list(syllables_per_minute.values()), list(syllables_per_minute.keys())
         ).tolist()
 
     def _set_speech_speed(self):
-        minutes = sorted(list(set([second // 60 for second in self.seconds])))
-        speed = dict(zip(minutes, self.syllables_per_second))
+        """Calculates speed of speech at each minute"""
+        seconds = [0]
+        for _, _, timestamps in self.chunks:
+            start, end = timestamps
+            seconds.append(end)
+        minutes = sorted(list(set([second // 60 for second in seconds])))
+        speed = dict(zip(minutes, self.syllables_per_minute))
         self._cache["speed"] = speed
 
-    def _set_transcripted_chunks(self):
-        _chunks = []
-        transcripted_chunks = []
-        speaker_to_id = {"Lector": 1, "Audience": 2, "Silence": 3}
+    def _set_chunks(self):
+        """Creates chunks in the folowing format: [speaker_id, text, (time_of_start, time_of_end)]"""
+        chunks = []
 
         model_id = "openai/whisper-large-v3"
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -349,34 +357,24 @@ class LectureHelper:
                 fragment_resampled = fragment_resampled.squeeze(0)
                 fragment_np = fragment_resampled.numpy()
 
-            if speaker != "Silence":
+            if speaker != 3:
                 text = speech_recognition_pipe(
                     inputs=fragment_np,
                     generate_kwargs={"language": "russian"},
                     return_timestamps=True,
                 )["text"]
-            else:
+            if speaker == 3 or text.strip() == "" or text == " Продолжение следует...":
                 text = ""
+                speaker = 3
+            chunks.append([speaker, text, (start, end)])
+        self._cache["chunks"] = chunks
 
-            if (
-                speaker == "Silence"
-                or text.strip() == ""
-                or text == " Продолжение следует..."
-            ):
-                text = ""
-                speaker = "Silence"
-            else:
-                text = speech_recognition_pipe(
-                    inputs=fragment_np,
-                    generate_kwargs={"language": "russian"},
-                    return_timestamps=True,
-                )["text"]
-
+    def _set_transcripted_chunks(self):
+        """Creates transcripted chunks in readable format"""
+        transcripted_chunks = []
+        for speaker, text, timestamp in self.chunks:
+            start, end = timestamp
             transcripted_chunks.append(
-                [speaker_to_id[speaker], text, f"{int(start // 60)}:{int(start % 60)}"]
-            )
-            _chunks.append(
-                [speaker_to_id[speaker], text, (start, end)]
+                [speaker, text, f"{int(start // 60)}:{int(start % 60)}"]
             )
         self._cache["transcripted_chunks"] = transcripted_chunks
-        self._cache["_chunks"] = _chunks
