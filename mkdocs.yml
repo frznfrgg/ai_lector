@@ -1,0 +1,30 @@
+site_name: AI Lector
+site_dir: "public/"
+docs_dir: src
+site_description: AI Lector project documentation
+
+theme:
+  name: "material"
+  palette:
+    scheme: slate
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            docstring_style: google
+            docstring_options:
+              returns_named_value: false
+  - mkdocs-jupyter:
+      execute: false
+      allow_errors: false
+      ignore_h1_titles: False
+      include_source: True
+
+nav:
+  - Home: "index.md"
+  - Source code: "source.md"
+  - Example class usage: "analyzer_example.ipynb"
