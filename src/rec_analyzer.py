@@ -1,6 +1,9 @@
+import io
 import json
 import os
+import uuid
 from collections import Counter
+from copy import deepcopy
 from typing import List, Tuple
 
 import numpy as np
@@ -9,7 +12,11 @@ import torchaudio
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 from pyannote.audio import Pipeline
+from pydub import AudioSegment
+from scipy.io.wavfile import write
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
 
 # store api keys as env variable and access them like in example below:
 # PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_API_KEY")
@@ -18,7 +25,12 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 STOPWORDS_PATH = "stopwords.txt"
 ROLE_PROMPT = "Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения"
 ABSTRACT_PROMPT = "Сделай конспект по тексту"
-QUESTIONS_PROMPT = "Приведи 7 вопросов для самопроверки по материалу этого же текста"
+QUESTIONS_PROMPT = "Приведи вопросы для самопроверки по материалу этого же текста"
+ANSWERS_PROMT = "Напиши текст подкаста, в котором ведущий задает эти вопросы, а лектор по материалу лекции на них отвечает. \
+    Придерживайся следующих правил: не добавляй ничего от себя и не делай вступление и завершение, \
+    но на вопросы отвечай очень развернуто, перед каждой репликой пиши ее автора - ведущий или лектор, не разделяй никак одну реплику, никак не выделяй слова в твоем ответе, \
+    используй двоеточие только когда пишешь автора речи и речь должна быть от первого лица."
+
 TREE_PROMPT = 'Создай по этому же тексту подробное дерево знаний. Придерживайся следующих правил: \
     В дереве ость только одна главная тема, которая содержит другие микротемы. \
     Дерево знаний должно быть глубоким, содержать много микротем. \
@@ -26,11 +38,6 @@ TREE_PROMPT = 'Создай по этому же тексту подробное
     У каждой темы обязательно должны быть поля id, topic и children. \
     Результат верни в формате JSON-массива без каких-либо пояснений, например: \
     {"id": "название текста", "topic": "Название текста", "children": [{"id": "название микротемы", "topic": "Название микротемы", "children":[{"id": "название микротемы", "topic": "Название микротемы", "children": []}]}]}.'
-MOOD_PROMPT = "По этому же тексту оцени общее настроение \
-    Придерживайся следующий правил: \
-    Результ верни в виде строки, содержащей словосочетание или короткое предложение, описывающее лекцию. \
-    Используй разные эпитеты чтобы точнее передать атмосферу на лекции \
-    Например: 'Интересно и полезно' или 'увлекательно и сложно' или 'скучно и непонятно'."
 
 
 class LectureHelper:
@@ -43,14 +50,18 @@ class LectureHelper:
         lecture_text (str): Full text of lection
         abstract_text (str): Summarized text of lection
         questions (str): Generated questions for lection
+        answers (str): Generated podcast text with answers om questions
         mind_map (str): JSON-like mindmap of lecture
-        mood (str): Overall mood of the lecture
         popular_words (List[Dict[str, int]]): List of the most popular words and number of their occasions
         diagram (List[Tuple[str, float]]): Statistics for pie chart representing active time for each speaker
         syllables_per_minute (List[float]): Speed of speach in syllables/min
         speed (Dict[int, int]): Speed of speech at each minute
         chunks (List[dict]]): Full text of lection splitted in chunks. Each item in list consists of a speaker id, text and timestamp
         transcripted_chunks (List[list]): Chunks in readable format
+        final chunks (List[list]): Chunks in readable format with emotional analysis
+        wav_path (str): Path to wav audio of lection
+        path_to_podcast (str): Path to wav audio of podcast
+        labeled_chunks (List[List]): time allocation of speakers
     """
 
     def __init__(
@@ -66,6 +77,7 @@ class LectureHelper:
             recording_path (str): path to file with the necessary audio file
             gigachat_api_key (str): secret api key for accessing GigaChat api service
             pyannote_api_key (str): secret api key for accessing pyannote model from Huggingface
+            recorID (str): ID of audio in database
 
         Raises:
             FileNotFoundError: raised if path to the file could not be found
@@ -84,18 +96,21 @@ class LectureHelper:
         self._cache = {}
 
         self.computations = {
+            "diagram": self._set_stat,
+            "labeled_chunks": self._set_stat,
+            "chunks": self._set_chunks,
             "lecture_text": self._set_lecture_text,
+            "popular_words": self._set_popular_words,
+            "syllables_per_minute": self._set_syllables_per_minute,
+            "speed": self._set_speech_speed,
+            "transcripted_chunks": self._set_transcripted_chunks,
             "abstract_text": self._gigachat_analyze,
             "questions": self._gigachat_analyze,
+            "answers": self._gigachat_analyze,
             "mind_map": self._gigachat_analyze,
-            "mood": self._gigachat_analyze,
-            "popular_words": self._set_popular_words,
-            "diagram": self._set_stat,
-            "syllables_per_minute": self._set_syllables_per_minute,
-            "chunks": self._set_chunks,
-            "labeled_chunks": self._set_stat,
-            "transcripted_chunks": self._set_transcripted_chunks,
-            "speed": self._set_speech_speed,
+            "final_chunks": self._gigachat_analyze,
+            "wav_path": self._prepair_audio,
+            "path_to_podcast": self._generate_podcast,
         }
 
     def __getattr__(self, name: str):
@@ -123,7 +138,7 @@ class LectureHelper:
         )
 
     def get_results(self):
-        """Json format of some attributes"""
+        """Json format of some attributes."""
 
         return json.dumps(
             {
@@ -133,98 +148,18 @@ class LectureHelper:
                 "mindmap": self.mind_map,
                 "popular_words": self.popular_words,
                 "conversation_static": self.diagram,
-                "lecture_timeline": self.transcripted_chunks,
+                "lecture_timeline": self.final_chunks,
                 "questions": self.questions,
+                "podcast": self.path_to_podcast,
             },
             default=str,
         )
-
-    def _set_lecture_text(self):
-        """Creates transcription of the recording and text of the lection splitted into chunks."""
-        lecture_text = ""
-        for _, text, _ in self.chunks:
-            lecture_text += text
-
-        self._cache["lecture_text"] = lecture_text
-
-    def _gigachat_analyze(self):
-        """Analyzes text using gigachat to generate abstract of text, questions, mind map and summarized lecture mood."""
-        payload = Chat(
-            messages=[
-                Messages(
-                    role=MessagesRole.SYSTEM,
-                    content=ROLE_PROMPT,
-                )
-            ],
-            temperature=0.3,
-        )
-        with GigaChat(
-            credentials=self.gigachat_api_key, verify_ssl_certs=False
-        ) as giga:
-            payload.messages.append(
-                Messages(
-                    role=MessagesRole.USER,
-                    content=f"{ABSTRACT_PROMPT}: [{self.lecture_text}]",
-                )
-            )
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            self._cache["abstract_text"] = response.choices[0].message.content
-
-            payload.messages.append(
-                Messages(role=MessagesRole.USER, content=QUESTIONS_PROMPT)
-            )
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            self._cache["questions"] = response.choices[0].message.content
-
-            payload.messages.append(
-                Messages(role=MessagesRole.USER, content=TREE_PROMPT)
-            )
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            mindmap = response.choices[0].message.content
-            mindmap = json.loads(mindmap)
-            mindmap = json.dumps(mindmap, indent=4, ensure_ascii=False)
-            self._cache["mind_map"] = mindmap
-
-            payload.messages.append(
-                Messages(role=MessagesRole.USER, content=MOOD_PROMPT)
-            )
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            self._cache["mood"] = response.choices[0].message.content
-
-    def _set_popular_words(self):
-        """Calculates the most common words."""
-        with open(STOPWORDS_PATH) as f:
-            stopwords = set(f.read().splitlines())
-        words = {1: [], 2: []}
-
-        for speaker, text, _ in self.chunks:
-            # if not silence
-            if speaker != 3:
-                words[speaker].extend(
-                    [
-                        word
-                        for word in text.lower().split()
-                        if word not in stopwords and word.isalpha()
-                    ]
-                )
-        word_counts_lector = Counter(words[1])
-        word_counts_audience = Counter(words[2])
-        popular_words = [
-            dict(word_counts_audience.most_common()[:10]),
-            dict(word_counts_lector.most_common()[:10]),
-        ]
-
-        self._cache["popular_words"] = popular_words
 
     def _fill_silence_intervals(
         self,
         data: List[Tuple[str, float, float]],
     ) -> List[Tuple[str, float, float]]:
-        """Fills intervals when no words were spoken"""
+        """Fills intervals when no words were spoken."""
         filled_data = []
 
         if data[0][1] > 0:
@@ -246,7 +181,7 @@ class LectureHelper:
             use_auth_token=self.pyannote_api_key,
         ).to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
 
-        diarization = pipeline(file=self.recording_path)
+        diarization = pipeline(file=self.wav_path)
 
         time_allocation = diarization.chart()
         t_lecturer = time_allocation[0][1]
@@ -283,35 +218,8 @@ class LectureHelper:
             timestamps_of_speakers
         )
 
-    def _set_syllables_per_minute(self):
-        """Calculates speed of speech in syllables per minute"""
-        vowels = ["а", "е", "ё", "и", "о", "у", "ы", "э", "ю", "я"]
-        total_syllables = 0
-        syllables_per_minute = {}
-        for speaker, text, timestamp in self.chunks:
-            if speaker != 3:
-                _, end = timestamp
-                end = end // 60
-                if end not in syllables_per_minute.keys():
-                    syllables_per_minute[end] = 0
-                total_syllables += sum(text.count(vowel) for vowel in vowels)
-                syllables_per_minute[end] = total_syllables
-        self._cache["syllables_per_minute"] = np.gradient(
-            list(syllables_per_minute.values()), list(syllables_per_minute.keys())
-        ).tolist()
-
-    def _set_speech_speed(self):
-        """Calculates speed of speech at each minute"""
-        seconds = [0]
-        for _, _, timestamps in self.chunks:
-            start, end = timestamps
-            seconds.append(end)
-        minutes = sorted(list(set([second // 60 for second in seconds])))
-        speed = dict(zip(minutes, self.syllables_per_minute))
-        self._cache["speed"] = speed
-
     def _set_chunks(self):
-        """Creates chunks in the folowing format: [speaker_id, text, (time_of_start, time_of_end)]"""
+        """Creates chunks in the folowing format: [speaker_id, text, (time_of_start, time_of_end)]."""
         chunks = []
 
         model_id = "openai/whisper-large-v3"
@@ -332,7 +240,7 @@ class LectureHelper:
             torch_dtype=self.torch_dtype,
             device=self.device,
         )
-        waveform, orig_sample_rate = torchaudio.load(self.recording_path)
+        waveform, orig_sample_rate = torchaudio.load(self.wav_path)
 
         for speaker, start, end in self.labeled_chunks:
             start_sample = int(start * orig_sample_rate)
@@ -369,12 +277,252 @@ class LectureHelper:
             chunks.append([speaker, text, (start, end)])
         self._cache["chunks"] = chunks
 
-    def _set_transcripted_chunks(self):
-        """Creates transcripted chunks in readable format"""
-        transcripted_chunks = []
+    def _set_lecture_text(self):
+        """Creates transcription of the recording and text of the lection splitted into chunks."""
+        lecture_text = ""
+        for _, text, _ in self.chunks:
+            lecture_text += text
+
+        self._cache["lecture_text"] = lecture_text
+
+    def _set_popular_words(self):
+        """Calculates the most common words."""
+        with open(STOPWORDS_PATH) as f:
+            stopwords = set(f.read().splitlines())
+        words = {1: [], 2: []}
+
+        for speaker, text, _ in self.chunks:
+            # if not silence
+            if speaker != 3:
+                words[speaker].extend(
+                    [
+                        word
+                        for word in text.lower().split()
+                        if word not in stopwords and word.isalpha()
+                    ]
+                )
+        word_counts_lector = Counter(words[1])
+        word_counts_audience = Counter(words[2])
+        popular_words = [
+            dict(word_counts_audience.most_common()[:10]),
+            dict(word_counts_lector.most_common()[:10]),
+        ]
+
+        self._cache["popular_words"] = popular_words
+
+    def _set_syllables_per_minute(self):
+        """Calculates speed of speech in syllables per minute."""
+        vowels = ["а", "е", "ё", "и", "о", "у", "ы", "э", "ю", "я"]
+        total_syllables = 0
+        syllables_per_minute = {}
         for speaker, text, timestamp in self.chunks:
-            start, end = timestamp
-            transcripted_chunks.append(
-                [speaker, text, f"{int(start // 60)}:{int(start % 60)}"]
+            if speaker != 3:
+                _, end = timestamp
+                end = end // 60
+                if end not in syllables_per_minute.keys():
+                    syllables_per_minute[end] = 0
+                total_syllables += sum(text.count(vowel) for vowel in vowels)
+                syllables_per_minute[end] = total_syllables
+        self._cache["syllables_per_minute"] = np.gradient(
+            list(syllables_per_minute.values()), list(syllables_per_minute.keys())
+        ).tolist()
+
+    def _set_speech_speed(self):
+        """Calculates speed of speech at each minute."""
+        seconds = [0]
+        for _, _, timestamps in self.chunks:
+            start, end = timestamps
+            seconds.append(end)
+        minutes = sorted(list(set([second // 60 for second in seconds])))
+        speed = dict(zip(minutes, self.syllables_per_minute))
+        self._cache["speed"] = speed
+
+    def _set_transcripted_chunks(self):
+        """Creates transcripted chunks in readable format."""
+        _transcripted_chunks = deepcopy(self.chunks)
+        del_ind = []
+
+        for i in range(len(_transcripted_chunks)):
+            if _transcripted_chunks[i][0] == 3:
+                if (
+                    int(_transcripted_chunks[i][2][1])
+                    - int(_transcripted_chunks[i][2][0])
+                    <= 4
+                ):
+                    del_ind.append(i)
+
+        for i in del_ind[::-1]:
+            del _transcripted_chunks[i]
+            if _transcripted_chunks[i - 1][0] == _transcripted_chunks[i][0]:
+                _transcripted_chunks[i - 1][1] += _transcripted_chunks[i][1]
+                _transcripted_chunks[i - 1][2] = list(_transcripted_chunks[i - 1][2])
+                _transcripted_chunks[i - 1][2][1] = _transcripted_chunks[i][2][1]
+                del _transcripted_chunks[i]
+
+        for i in range(len(_transcripted_chunks)):
+            start, end = _transcripted_chunks[i][2]
+            _transcripted_chunks[i][2] = f"{int(start // 60)}:{int(start % 60)}"
+        self._cache["transcripted_chunks"] = _transcripted_chunks
+
+    def _gigachat_analyze(self):
+        """Analyzes text using gigachat to generate abstract of text, questions, podcast text with answers, mind map and summarized."""
+        payload = Chat(
+            messages=[
+                Messages(
+                    role=MessagesRole.SYSTEM,
+                    content=ROLE_PROMPT,
+                )
+            ],
+            temperature=0.3,
+        )
+        with GigaChat(
+            credentials=self.gigachat_api_key,
+            verify_ssl_certs=False,
+        ) as giga:
+            payload.messages.append(
+                Messages(
+                    role=MessagesRole.USER,
+                    content=f"{ABSTRACT_PROMPT}: [{self.lecture_text}]",
+                )
             )
-        self._cache["transcripted_chunks"] = transcripted_chunks
+
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            self._cache["abstract_text"] = response.choices[0].message.content
+
+            payload.messages.append(
+                Messages(role=MessagesRole.USER, content=TREE_PROMPT)
+            )
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            mindmap = response.choices[0].message.content
+            mindmap = json.loads(mindmap)
+            mindmap = json.dumps(mindmap, indent=4, ensure_ascii=False)
+            self._cache["mind_map"] = mindmap
+
+            payload.messages.append(
+                Messages(role=MessagesRole.USER, content=QUESTIONS_PROMPT)
+            )
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            self._cache["questions"] = response.choices[0].message.content
+
+            payload.messages.append(
+                Messages(role=MessagesRole.USER, content=ANSWERS_PROMT)
+            )
+            response = giga.chat(payload)
+            payload.messages.append(response.choices[0].message)
+            self._cache["answers"] = response.choices[0].message.content
+
+            transc_chunks_f_giga = deepcopy(self.transcripted_chunks)
+            for i in range(len(transc_chunks_f_giga)):
+                if transc_chunks_f_giga[i][0] == 1:
+                    payload.messages.append(
+                        Messages(
+                            role=MessagesRole.USER,
+                            content=f"Оцени настроение этого куска лекции{transc_chunks_f_giga[i][1]}\
+                                        Придерживайся следующий правил: \
+                                        Результ верни в виде строки, содержащей словосочетание или короткое предложение, описывающее лекцию. \
+                                        Используй разные эпитеты чтобы точнее передать атмосферу на лекции \
+                                        Например: 'Интересно и полезно' или 'увлекательно и сложно' или 'скучно и непонятно'.",
+                        )
+                    )
+                    response = giga.chat(payload)
+                    payload.messages.append(response.choices[0].message)
+                    transc_chunks_f_giga[i].append(response.choices[0].message.content)
+            self._cache["final_chunks"] = transc_chunks_f_giga
+
+    def _prepair_audio(self):
+        """Converts audio from mp3 to wav."""
+        if ".mp3" in self.recording_path:
+            audio = AudioSegment.from_mp3(self.recording_path)
+
+            wav_file = self.recording_path[: self.recording_path.find(".")] + ".wav"
+            audio.export(wav_file, format="wav")
+
+            self._cache["wav_path"] = wav_file
+
+    def _generate_podcast(self):
+        """Generates podcast using XTTS-v2."""
+
+        answ = self.answers
+        podcast_text = answ.split("\n\n")
+
+        for i in range(len(podcast_text)):
+            if "**" in podcast_text[i]:
+                podcast_text[i] = podcast_text[i].replace("**", "")
+
+        result = []
+        for i in podcast_text:
+            result.append([i[: i.find(":")], i[i.find(":") + 2 :]])
+
+        podcast_chunks = []
+        max_length = 150
+        for _, text in result:
+            sublist = []
+            while len(text) > max_length:
+                split_pos = text[:max_length].rfind(".")
+                if split_pos == -1:
+                    split_pos = text[:max_length].rfind(" ")
+                    if split_pos == -1:
+                        split_pos = max_length
+                sublist.append(text[: split_pos + 1].strip())
+                text = text[split_pos + 1 :].strip()
+            if text:
+                sublist.append(text)
+
+            podcast_chunks.append([_, sublist])
+
+        config = XttsConfig()
+        config.load_json("../XTTS-v2/config.json")
+        model = Xtts.init_from_config(config)
+        model.load_checkpoint(config, checkpoint_dir="../XTTS-v2/")
+        model.cuda()
+
+        fin_aud = np.array([])
+        pause = np.zeros(5000, dtype=np.float32)
+        for speech in podcast_chunks:
+            host_aud = np.array([])
+            if "Ведущий" in speech[0]:
+                for i in speech[1]:
+                    outputs_host = model.synthesize(
+                        i,
+                        config,
+                        speaker_wav="../utils/podcast_host.wav",
+                        gpt_cond_len=5,
+                        language="ru",
+                    )
+                    host_aud = np.concatenate((host_aud, pause, outputs_host["wav"]))
+
+            lector_aud = np.array([])
+            if "Лектор" in speech[0]:
+                for j in speech[1]:
+                    outputs_lector = model.synthesize(
+                        j,
+                        config,
+                        speaker_wav=self.wav_path,
+                        gpt_cond_len=5,
+                        language="ru",
+                    )
+                    lector_aud = np.concatenate(
+                        (lector_aud, pause, outputs_lector["wav"])
+                    )
+
+            fin_aud = np.concatenate((fin_aud, host_aud, lector_aud))
+
+        output_file_path = str(uuid.uuid4()) + ".mp3"
+
+        fin_aud_int16 = (fin_aud * 32767).astype(np.int16)
+
+        wav_buffer = io.BytesIO()
+        write(wav_buffer, 24000, fin_aud_int16)
+        wav_buffer.seek(0)
+
+        audio = AudioSegment.from_file(wav_buffer, format="wav")
+
+        audio.export(output_file_path, format="mp3", bitrate="192k")
+
+        self._cache["path_to_podcast"] = output_file_path
+
+        wav_buffer.close()
+        os.remove(self.wav_path)
