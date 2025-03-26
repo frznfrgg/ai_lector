@@ -52,7 +52,8 @@ class LectureHelper:
         questions (str): Generated questions for lection
         answers (str): Generated podcast text with answers om questions
         mind_map (str): JSON-like mindmap of lecture
-        popular_words (List[Dict[str, int]]): List of the most popular words and number of their occasions
+        popular_words_no_stopw (List[Dict[str, int]]): List of the most popular words and number of their occasions without stopwords
+        popular_words_w_stopw (List[Dict[str, int]]): List of the most popular words and number of their occasions with stopwords
         diagram (List[Tuple[str, float]]): Statistics for pie chart representing active time for each speaker
         syllables_per_minute (List[float]): Speed of speach in syllables/min
         speed (Dict[int, int]): Speed of speech at each minute
