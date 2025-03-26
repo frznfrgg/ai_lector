@@ -100,7 +100,8 @@ class LectureHelper:
             "labeled_chunks": self._set_stat,
             "chunks": self._set_chunks,
             "lecture_text": self._set_lecture_text,
-            "popular_words": self._set_popular_words,
+            "popular_words_no_stopw": self._set_popular_words,
+            "popular_words_w_stopw": self._set_popular_words,
             "syllables_per_minute": self._set_syllables_per_minute,
             "speed": self._set_speech_speed,
             "transcripted_chunks": self._set_transcripted_chunks,
@@ -146,7 +147,8 @@ class LectureHelper:
                 "abstract_text": self.abstract_text,
                 "speech_speed": self.speed,
                 "mindmap": self.mind_map,
-                "popular_words": self.popular_words,
+                "popular_words_no_stopw": self.popular_words_no_stopw,
+                "popular_words_w_stopw": self.popular_words_w_stopw,
                 "conversation_static": self.diagram,
                 "lecture_timeline": self.final_chunks,
                 "questions": self.questions,
@@ -289,26 +291,42 @@ class LectureHelper:
         """Calculates the most common words."""
         with open(STOPWORDS_PATH) as f:
             stopwords = set(f.read().splitlines())
-        words = {1: [], 2: []}
+        word_no_stopw = {1: [], 2: []}
 
         for speaker, text, _ in self.chunks:
             # if not silence
             if speaker != 3:
-                words[speaker].extend(
+                word_no_stopw[speaker].extend(
                     [
                         word
                         for word in text.lower().split()
                         if word not in stopwords and word.isalpha()
                     ]
                 )
-        word_counts_lector = Counter(words[1])
-        word_counts_audience = Counter(words[2])
-        popular_words = [
-            dict(word_counts_audience.most_common()[:10]),
-            dict(word_counts_lector.most_common()[:10]),
+        word_counts_lector_no_stopw = Counter(word_no_stopw[1])
+        word_counts_audience_no_stopw = Counter(word_no_stopw[2])
+        popular_words_no_stopw = [
+            dict(word_counts_audience_no_stopw.most_common()[:10]),
+            dict(word_counts_lector_no_stopw.most_common()[:10]),
         ]
 
-        self._cache["popular_words"] = popular_words
+        self._cache["popular_words_no_stopw"] = popular_words_no_stopw
+
+        word_w_stopw = {1: [], 2: []}
+        for speaker, text, _ in self.chunks:
+            # if not silence
+            if speaker != 3:
+                word_w_stopw[speaker].extend(
+                    [word for word in text.lower().split() if word.isalpha()]
+                )
+        word_counts_lector_w_stopw = Counter(word_w_stopw[1])
+        word_counts_audience_w_stpow = Counter(word_w_stopw[2])
+        popular_words_w_stopw = [
+            dict(word_counts_audience_w_stpow.most_common()[:10]),
+            dict(word_counts_lector_w_stopw.most_common()[:10]),
+        ]
+
+        self._cache["popular_words_w_stopw"] = popular_words_w_stopw
 
     def _set_syllables_per_minute(self):
         """Calculates speed of speech in syllables per minute."""
@@ -474,9 +492,9 @@ class LectureHelper:
             podcast_chunks.append([_, sublist])
 
         config = XttsConfig()
-        config.load_json("../XTTS-v2/config.json")
+        config.load_json("./XTTS-v2/config.json")
         model = Xtts.init_from_config(config)
-        model.load_checkpoint(config, checkpoint_dir="../XTTS-v2/")
+        model.load_checkpoint(config, checkpoint_dir="./XTTS-v2/")
         model.cuda()
 
         fin_aud = np.array([])
@@ -488,7 +506,7 @@ class LectureHelper:
                     outputs_host = model.synthesize(
                         i,
                         config,
-                        speaker_wav="../utils/podcast_host.wav",
+                        speaker_wav="utils/podcast_host.wav",
                         gpt_cond_len=5,
                         language="ru",
                     )
