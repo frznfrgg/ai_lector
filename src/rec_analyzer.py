@@ -1,4 +1,3 @@
-import io
 import json
 import os
 import uuid
@@ -493,9 +492,9 @@ class LectureHelper:
             podcast_chunks.append([_, sublist])
 
         config = XttsConfig()
-        config.load_json("./XTTS-v2/config.json")
+        config.load_json("../XTTS-v2/config.json")
         model = Xtts.init_from_config(config)
-        model.load_checkpoint(config, checkpoint_dir="./XTTS-v2/")
+        model.load_checkpoint(config, checkpoint_dir="../XTTS-v2/")
         model.cuda()
 
         fin_aud = np.array([])
@@ -507,7 +506,7 @@ class LectureHelper:
                     outputs_host = model.synthesize(
                         i,
                         config,
-                        speaker_wav="utils/podcast_host.wav",
+                        speaker_wav="../utils/podcast_host.wav",
                         gpt_cond_len=5,
                         language="ru",
                     )
@@ -529,19 +528,15 @@ class LectureHelper:
 
             fin_aud = np.concatenate((fin_aud, host_aud, lector_aud))
 
-        output_file_path = str(uuid.uuid4()) + ".mp3"
+        output_file_path = str(uuid.uuid4())
 
-        fin_aud_int16 = (fin_aud * 32767).astype(np.int16)
+        write(output_file_path + ".wav", 24000, fin_aud)
 
-        wav_buffer = io.BytesIO()
-        write(wav_buffer, 24000, fin_aud_int16)
-        wav_buffer.seek(0)
+        audio = AudioSegment.from_file(output_file_path + ".wav", format="wav")
 
-        audio = AudioSegment.from_file(wav_buffer, format="wav")
+        audio.export(output_file_path + ".mp3", format="mp3", bitrate="192k")
 
-        audio.export(output_file_path, format="mp3", bitrate="192k")
+        self._cache["path_to_podcast"] = output_file_path + ".mp3"
 
-        self._cache["path_to_podcast"] = output_file_path
-
-        wav_buffer.close()
+        os.remove(output_file_path + ".wav")
         os.remove(self.wav_path)
