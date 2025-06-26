@@ -8,36 +8,43 @@ from typing import List, Tuple
 import numpy as np
 import torch
 import torchaudio
-from gigachat import GigaChat
-from gigachat.models import Chat, Messages, MessagesRole
+import librosa
+import xtts_inference
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
-from scipy.io.wavfile import write
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import Xtts
-
-# store api keys as env variable and access them like in example below:
-# PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_API_KEY")
-# GIGACHAT_API_KEY = os.environ.get("GIGACHAT_API_KEY")
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline, AutoModelForCausalLM, AutoTokenizer
+from voicefixer import VoiceFixer
 
 STOPWORDS_PATH = "stopwords.txt"
-ROLE_PROMPT = "Ты выступаешь в роли автора учебо-методических пособий для высшего учебного заведения"
-ABSTRACT_PROMPT = "Сделай конспект по тексту"
-QUESTIONS_PROMPT = "Приведи вопросы для самопроверки по материалу этого же текста"
-ANSWERS_PROMT = "Напиши текст подкаста, в котором ведущий задает эти вопросы, а лектор по материалу лекции на них отвечает. \
-    Придерживайся следующих правил: не добавляй ничего от себя и не делай вступление и завершение, \
-    но на вопросы отвечай очень развернуто, перед каждой репликой пиши ее автора - ведущий или лектор, не разделяй никак одну реплику, никак не выделяй слова в твоем ответе, \
-    используй двоеточие только когда пишешь автора речи и речь должна быть от первого лица."
-
-TREE_PROMPT = 'Создай по этому же тексту подробное дерево знаний. Придерживайся следующих правил: \
-    В дереве ость только одна главная тема, которая содержит другие микротемы. \
-    Дерево знаний должно быть глубоким, содержать много микротем. \
-    Описание каждой темы должны состоять из словосочетаний или очень коротких предложений \
-    У каждой темы обязательно должны быть поля id, topic и children. \
-    Результат верни в формате JSON-массива без каких-либо пояснений, например: \
-    {"id": "название текста", "topic": "Название текста", "children": [{"id": "название микротемы", "topic": "Название микротемы", "children":[{"id": "название микротемы", "topic": "Название микротемы", "children": []}]}]}.'
-
+MODEL_NAME = "yandex/YandexGPT-5-Lite-8B-instruct"
+ABSTRACT_PROMPT = "Ты - помощник-конспетолог. Дальше будет дан длинный текст лекции. Твоя задача - составить по нему подробный, информативный и связный конспект. Конспект должен быть понятен человеку, не читавшему лекцию, и давать хорошее понимание темы лекции"
+EMOT_AN_PROMPT = "Ты - анализитор лекционных фрагментов. Дальше будет дан отрывок лекции. Оцени его по содержанию и эмоциональной подаче. Используй не больше 2 ярких прилагательных и ничего больше"
+MINDMAP_PROMPT = 'Ты — интеллектуальный ассистент, который умеет превращать лекции в структурированные интеллект-карты (mindmap). Проанализируй текст лекции, которая будет дальше, и выдели из него основные темы, подтемы и детали. Структурируй информацию в иерархическую JSON-структуру, отражающую смысловую организацию материала. \
+                Формат JSON: каждая тема — это ключ, а её значение либо массив подтем, либо объект с вложенными подтемами. Если нет дальнейших деталей, используй пустой массив. \
+                Пример:\
+                {"title": "название лекции", "nodes": [{"id": "название текста", "label": "Название текста", "children": [{"id": "название микротемы", "label": "Название микротемы", "children":[{"id": "название микротемы", "label": "Название микротемы", "children": []}]}]}]}'
+QUESTIONS_PROMPT = "Ты - автор учебных пособий с большим опытом. По тексту лекции, который будет дан дальше, создай вопросы для самопроверки на знание материала.\
+    Вопросы должны быть на разные темы и разные по сложности и должны охватывать ключевые факты, причино-следственные связи и важные детали"
+PODCAST_PROMPT = "Ты — опытный редактор образовательных подкастов. Твоя задача — по тексту лекции и списку вопросов создать сценарий диалога между ведущим подкаста и автором лекции. \
+    Ведущий задаёт вопросы, а лектор отвечает на них подробно, понятно и строго по содержанию лекции. \
+    Диалог должен начинаться с короткого приветствия от ведущего и лектора, а завершаться тёплым прощанием от обоих. \
+    Пиши исключительно на русском языке. Все даты, века, порядковые и количественные числительные обязательно пиши только словами (например: «девятнадцатый век», «две тысячи третий год», «тринадцать вариантов»). \
+    Не используй формулы, переменные, математические обозначения, символы, LaTeX-нотацию или аббревиатуры (например, M(n), $2^{n-1}$, log, n). Переписывай смысл полностью словами. \
+    Не используй заглушки вроде [имя преподавателя] — обращайся нейтрально, например: «наш гость», «автор лекции» и т.д. \
+    Ответ верни строго в формате JSON, где каждая часть диалога — это отдельный элемент: \
+    {\"part_1\": {\"presenter\": \"слова ведущего\", \"lector\": \"слова лектора\"}, \
+    \"part_2\": {\"presenter\": \"вопрос ведущего\", \"lector\": \"ответ лектора\"}, ...} \
+    Стиль речи — литературный, но живой и дружелюбный. Соблюдай структуру строго, не добавляй ничего вне JSON. Обязательно заверши диалог прощанием. Обязательно придерживайся всех сказанных правил, ни в коем случае не нарушай их"
+CLEAN_PODCAST = "Перепиши данный JSON-диалог, строго соблюдая следующие требования: \
+1. Пиши исключительно на русском языке. Не допускается использование слов, символов, переменных или выражений на английском (например, function, log, n-graph и т.п.). \
+2. Заменяй все математические обозначения, переменные и формулы (например, M(n), n-1, n-однородный, $2^{n-1}$, log, f(x)) на полноценные пояснения словами, понятные широкой аудитории. Примеры: \
+- 'n-однородный гиперграф' → 'гиперграф, в котором каждое ребро соединяет одинаковое количество вершин' \
+- '$2^{n-1}$' → 'два в степени эн минус один' \
+- 'M(n)'' → 'функция, значение которой зависит от количества элементов' \
+3. Не оставляй никаких формул, переменных, символов или сокращений в тексте. Всё должно быть записано литературным, полным и понятным языком. \
+4. Все числа, годы и века — пиши словами. Например: «две тысячи третий год», «девятнадцатый век», «шестнадцать вариантов». \
+5. Удали любые плейсхолдеры (например, [имя преподавателя]) и замени их на «лектор», «автор лекции» или аналогичные формулировки. \
+Верни только исправленный JSON-объект. Не добавляй никаких пояснений, комментариев или лишнего текста."
 
 class LectureHelper:
     """Audio recording analyzer class.
@@ -67,7 +74,6 @@ class LectureHelper:
     def __init__(
         self,
         recording_path: str,
-        gigachat_api_key: str,
         pyannote_api_key: str,
         recordId: str,
     ):
@@ -85,7 +91,6 @@ class LectureHelper:
         self.recordId = recordId
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        self.gigachat_api_key = gigachat_api_key
         self.pyannote_api_key = pyannote_api_key
         if os.path.exists(recording_path):
             self.recording_path = recording_path
@@ -105,12 +110,16 @@ class LectureHelper:
             "syllables_per_minute": self._set_syllables_per_minute,
             "speed": self._set_speech_speed,
             "transcripted_chunks": self._set_transcripted_chunks,
-            "abstract_text": self._gigachat_analyze,
-            "questions": self._gigachat_analyze,
-            "answers": self._gigachat_analyze,
-            "mind_map": self._gigachat_analyze,
-            "final_chunks": self._gigachat_analyze,
             "wav_path": self._prepair_audio,
+            "waveform": self._prepair_audio,
+            "sample_rate": self._prepair_audio,
+            "abstract_text": self._yandexgpt_analyze,
+            "questions": self._yandexgpt_analyze,
+            "podcast_text": self._yandexgpt_analyze,
+            "mind_map": self._yandexgpt_analyze,
+            "final_chunks": self._yandexgpt_analyze,
+            "fragment" : self._extract_clean_fragment,
+            "clean_fragment": self._extract_clean_fragment,
             "path_to_podcast": self._generate_podcast,
         }
 
@@ -175,9 +184,22 @@ class LectureHelper:
                 if end < next_start:
                     filled_data.append([3, end, next_start])
         return filled_data
+    
+    def _clean_json(self, text: str):
+        """transform string to JSON"""
+        text = text.strip()
+        if text.startswith("```") and text.endswith("```"):
+            text = text[3:-3].strip()
+        return json.loads(text)
+    
+    def _clear_gpu_cache(self):
+        """Clear the GPU cache if CUDA is available."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _set_stat(self):
         """Calculates statistics for diagram, and creates chunks labeled by speaker."""
+        self._clear_gpu_cache()
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=self.pyannote_api_key,
@@ -213,7 +235,7 @@ class LectureHelper:
 
         self._cache["diagram"] = {
             "lecturer": t_lecturer / time_of_events * 100.0,
-            "discussion": t_audience / time_of_events * 100.0,
+               "discussion": t_audience / time_of_events * 100.0,
             "quiet": t_silence / time_of_events * 100.0,
         }
         self._cache["labeled_chunks"] = self._fill_silence_intervals(
@@ -222,6 +244,7 @@ class LectureHelper:
 
     def _set_chunks(self):
         """Creates chunks in the folowing format: [speaker_id, text, (time_of_start, time_of_end)]."""
+        self._clear_gpu_cache()
         chunks = []
 
         model_id = "openai/whisper-large-v3"
@@ -242,26 +265,22 @@ class LectureHelper:
             torch_dtype=self.torch_dtype,
             device=self.device,
         )
-        waveform, orig_sample_rate = torchaudio.load(self.wav_path)
 
         for speaker, start, end in self.labeled_chunks:
-            start_sample = int(start * orig_sample_rate)
-            end_sample = int(end * orig_sample_rate)
-            fragment = waveform[:, start_sample:end_sample]
+            start_sample = int(start * self.sample_rate)
+            end_sample = int(end * self.sample_rate)
+            fragment = self.waveform[:, start_sample:end_sample]
 
-            # convert to mono if necessary (whisper expects mono audio)
             if fragment.shape[0] > 1:
                 fragment = fragment.mean(dim=0, keepdim=True)
 
-            # remove channel dimension (now shape: [1, samples] -> [samples])
             fragment = fragment.squeeze(0)
             fragment_np = fragment.numpy()
 
-            # ensure the sampling rate matches what the feature extractor expects
             target_sample_rate = processor.feature_extractor.sampling_rate
-            if orig_sample_rate != target_sample_rate:
+            if self.sample_rate != target_sample_rate:
                 resampler = torchaudio.transforms.Resample(
-                    orig_freq=orig_sample_rate, new_freq=target_sample_rate
+                    orig_freq=self.sample_rate, new_freq=target_sample_rate
                 )
                 fragment_resampled = resampler(fragment.unsqueeze(0))
                 fragment_resampled = fragment_resampled.squeeze(0)
@@ -276,7 +295,7 @@ class LectureHelper:
             if speaker == 3 or text.strip() == "" or text == " Продолжение следует...":
                 text = ""
                 speaker = 3
-            chunks.append([speaker, text, (start, end)])
+            chunks.append([speaker, text.strip(), (start, end)])
         self._cache["chunks"] = chunks
 
     def _set_lecture_text(self):
@@ -359,13 +378,14 @@ class LectureHelper:
         """Creates transcripted chunks in readable format."""
         _transcripted_chunks = deepcopy(self.chunks)
         del_ind = []
-
+        silence_intervals = [i[2][1]-i[2][0] for i in self.chunks if i[0]==3]
+        mean = sum(silence_intervals) / len(silence_intervals)
         for i in range(len(_transcripted_chunks)):
             if _transcripted_chunks[i][0] == 3:
                 if (
-                    int(_transcripted_chunks[i][2][1])
-                    - int(_transcripted_chunks[i][2][0])
-                    <= 4
+                    float(_transcripted_chunks[i][2][1])
+                    - float(_transcripted_chunks[i][2][0])
+                    <= mean
                 ):
                     del_ind.append(i)
 
@@ -382,155 +402,130 @@ class LectureHelper:
             _transcripted_chunks[i][2] = f"{int(start // 60)}:{int(start % 60)}"
         self._cache["transcripted_chunks"] = _transcripted_chunks
 
-    def _gigachat_analyze(self):
-        """Analyzes text using gigachat to generate abstract of text, questions, podcast text with answers, mind map and summarized."""
-        payload = Chat(
-            messages=[
-                Messages(
-                    role=MessagesRole.SYSTEM,
-                    content=ROLE_PROMPT,
-                )
-            ],
-            temperature=0.3,
-        )
-        with GigaChat(
-            credentials=self.gigachat_api_key,
-            verify_ssl_certs=False,
-        ) as giga:
-            payload.messages.append(
-                Messages(
-                    role=MessagesRole.USER,
-                    content=f"{ABSTRACT_PROMPT}: [{self.lecture_text}]",
-                )
-            )
+    def _yandexgpt_analyze(self):
+        """Analyzes text using yandexgpt to generate abstract of text, questions, podcast text with answers, mind map and summarized."""
+        self._clear_gpu_cache()
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            device_map="cuda",
+            torch_dtype="auto")
+        
+        abstract_message = [{"role": "user", "content": f"{ABSTRACT_PROMPT}: {self.lecture_text}"}]
+        abstract_input_ids = tokenizer.apply_chat_template(
+            abstract_message, tokenize=True, return_tensors="pt").to("cuda")
+        outputs_abstract = model.generate(abstract_input_ids, max_new_tokens=32000)
+        abstract = tokenizer.decode(outputs_abstract[0][abstract_input_ids.size(1) :], skip_special_tokens=True)
+        self._cache["abstract_text"] = abstract
 
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            self._cache["abstract_text"] = response.choices[0].message.content
+        final_chunks = deepcopy(self.transcripted_chunks)
+        for i in range(len(final_chunks)):
+            if final_chunks[i][0] == 1:
+                emot_analyz_mess = [{"role": "user", "content": f"{EMOT_AN_PROMPT}: {final_chunks[i][1]}"}]
+                emot_analyz_input_ids = tokenizer.apply_chat_template(
+                    emot_analyz_mess, tokenize=True, return_tensors="pt"
+                ).to("cuda")
+                outputs_emot_analyz = model.generate(emot_analyz_input_ids, max_new_tokens=10)
+                emot_analyz = tokenizer.decode(outputs_emot_analyz[0][emot_analyz_input_ids.size(1) :], skip_special_tokens=True)
+                final_chunks[i].append(emot_analyz)
+        self._cache["final_chunks"] = final_chunks
 
-            payload.messages.append(
-                Messages(role=MessagesRole.USER, content=TREE_PROMPT)
-            )
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            mindmap = response.choices[0].message.content
-            mindmap = json.loads(mindmap)
-            mindmap = json.dumps(mindmap, indent=4, ensure_ascii=False)
-            self._cache["mind_map"] = mindmap
+        mindmap_message = [{"role": "user", "content": f"{MINDMAP_PROMPT}: {self.lecture_text}"}]
+        mindmap_input_ids = tokenizer.apply_chat_template(
+            mindmap_message, tokenize=True, return_tensors="pt"
+        ).to("cuda")
+        mindmap_output = model.generate(mindmap_input_ids, max_new_tokens=32000)
+        mindmap = tokenizer.decode(mindmap_output[0][mindmap_input_ids.size(1) :], skip_special_tokens=True)
+        cleaned_mindmap = self._clean_json(mindmap)
+        cleaned_mindmap = json.dumps(cleaned_mindmap, indent=4, ensure_ascii=False)
+        self._cache["mind_map"] = cleaned_mindmap
 
-            payload.messages.append(
-                Messages(role=MessagesRole.USER, content=QUESTIONS_PROMPT)
-            )
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            self._cache["questions"] = response.choices[0].message.content
+        quest_message = [{"role": "user", "content": f"{QUESTIONS_PROMPT}: {self.lecture_text}"}]
+        quest_input_ids = tokenizer.apply_chat_template(
+            quest_message, tokenize=True, return_tensors="pt"
+        ).to("cuda")
+        quests_output = model.generate(quest_input_ids, max_new_tokens=32000)
+        quests = tokenizer.decode(quests_output[0][quest_input_ids.size(1) :], skip_special_tokens=True)
+        self._cache['questions'] = quests
 
-            payload.messages.append(
-                Messages(role=MessagesRole.USER, content=ANSWERS_PROMT)
-            )
-            response = giga.chat(payload)
-            payload.messages.append(response.choices[0].message)
-            self._cache["answers"] = response.choices[0].message.content
+        podcast_message = [{"role": "user", "content": f"{PODCAST_PROMPT}: Лекция: {self.lecture_text}. Вопросы: {quests}"}]
+        podcast_input_ids = tokenizer.apply_chat_template(
+            podcast_message, tokenize=True, return_tensors="pt"
+        ).to("cuda")
+        podcast_output = model.generate(podcast_input_ids, max_new_tokens=32000)
+        podcast_text = tokenizer.decode(podcast_output[0][podcast_input_ids.size(1) :], skip_special_tokens=True)
 
-            transc_chunks_f_giga = deepcopy(self.transcripted_chunks)
-            for i in range(len(transc_chunks_f_giga)):
-                if transc_chunks_f_giga[i][0] == 1:
-                    payload.messages.append(
-                        Messages(
-                            role=MessagesRole.USER,
-                            content=f"Оцени настроение этого куска лекции{transc_chunks_f_giga[i][1]}\
-                                        Придерживайся следующий правил: \
-                                        Результ верни в виде строки, содержащей словосочетание или короткое предложение, описывающее лекцию. \
-                                        Используй разные эпитеты чтобы точнее передать атмосферу на лекции \
-                                        Например: 'Интересно и полезно' или 'увлекательно и сложно' или 'скучно и непонятно'.",
-                        )
-                    )
-                    response = giga.chat(payload)
-                    payload.messages.append(response.choices[0].message)
-                    transc_chunks_f_giga[i].append(response.choices[0].message.content)
-            self._cache["final_chunks"] = transc_chunks_f_giga
-
+        clean_podcast_prompt = [{"role": "user", "content": f"{CLEAN_PODCAST}: {self._clean_json(podcast_text)}"}]
+        clean_podcast_input_ids = tokenizer.apply_chat_template(
+            clean_podcast_prompt, tokenize=True, return_tensors="pt").to("cuda")
+        outputs_clean_podcast = model.generate(clean_podcast_input_ids, max_new_tokens=32000)
+        clean_podcast = tokenizer.decode(outputs_clean_podcast[0][clean_podcast_input_ids.size(1) :], skip_special_tokens=True)
+        self._cache["podcast_text"] = self._clean_json(clean_podcast)
+        self._clear_gpu_cache()
+        
     def _prepair_audio(self):
         """Converts audio from mp3 to wav."""
         if ".mp3" in self.recording_path:
-            audio = AudioSegment.from_mp3(self.recording_path)
+            waveform, sample_rate = torchaudio.load(self.recording_path)
+            wav_path = self.recording_path[:self.recording_path.find(".")] + ".wav"
+            torchaudio.save(wav_path, waveform, sample_rate)
+            self._cache["wav_path"] = wav_path
+            self._cache["waveform"] = waveform
+            self._cache["sample_rate"] = sample_rate
+        elif ".wav" in self.recording_path:
+            waveform, sample_rate = torchaudio.load(self.recording_path)
+            self._cache["wav_path"] = self.recording_path
+            self._cache["waveform"] = waveform
+            self._cache["sample_rate"] = sample_rate
+    
+    def _extract_clean_fragment(self, target_duration=60, sr=22050):
+        """Extracting a fragment with the lectors clear voice.
 
-            wav_file = self.recording_path[: self.recording_path.find(".")] + ".wav"
-            audio.export(wav_file, format="wav")
+        Args:
+            target_duration (int, optional): length of clean fragment of lectors voice. Defaults to 60.
+            sr (int, optional): sample rate of a  fragment. Defaults to 22050.
+        """
+        _waveform = self.waveform.mean(dim=0).numpy()  # mono
 
-            self._cache["wav_path"] = wav_file
+        if self.sample_rate != sr:
+            _waveform = librosa.resample(y=_waveform, orig_sr=self.sample_rate, target_sr=sr)
+
+        trimmed, _ = librosa.effects.trim(_waveform, top_db=30)
+
+        total_len = len(trimmed)
+        max_samples = target_duration * sr
+
+        if total_len <= max_samples:
+            fragment = trimmed
+        else:
+            start = (total_len - max_samples) // 2
+            end = start + max_samples
+            fragment = trimmed[start:end]
+        self._cache["fragment"] = fragment
+        torchaudio.save(f"clean_{self.wav_path}", torch.tensor(fragment).unsqueeze(0), sr)
+        self._cache["clean_fragment"] = f"clean_{self.wav_path}"
+        voicefixer = VoiceFixer()
+        voicefixer.restore(input=self.clean_fragment, output=self.clean_fragment)
 
     def _generate_podcast(self):
         """Generates podcast using XTTS-v2."""
 
-        answ = self.answers
-        podcast_text = answ.split("\n\n")
+        podcast_text = deepcopy(self.podcast_text)
+        
+        xtts_model = xtts_inference.XttsInference()
 
-        for i in range(len(podcast_text)):
-            if "**" in podcast_text[i]:
-                podcast_text[i] = podcast_text[i].replace("**", "")
-
-        result = []
-        for i in podcast_text:
-            result.append([i[: i.find(":")], i[i.find(":") + 2 :]])
-
-        podcast_chunks = []
-        max_length = 150
-        for _, text in result:
-            sublist = []
-            while len(text) > max_length:
-                split_pos = text[:max_length].rfind(".")
-                if split_pos == -1:
-                    split_pos = text[:max_length].rfind(" ")
-                    if split_pos == -1:
-                        split_pos = max_length
-                sublist.append(text[: split_pos + 1].strip())
-                text = text[split_pos + 1 :].strip()
-            if text:
-                sublist.append(text)
-
-            podcast_chunks.append([_, sublist])
-
-        config = XttsConfig()
-        config.load_json("../XTTS-v2/config.json")
-        model = Xtts.init_from_config(config)
-        model.load_checkpoint(config, checkpoint_dir="../XTTS-v2/")
-        model.cuda()
-
-        fin_aud = np.array([])
-        pause = np.zeros(5000, dtype=np.float32)
-        for speech in podcast_chunks:
-            host_aud = np.array([])
-            if "Ведущий" in speech[0]:
-                for i in speech[1]:
-                    outputs_host = model.synthesize(
-                        i,
-                        config,
-                        speaker_wav="../utils/podcast_host.wav",
-                        gpt_cond_len=5,
-                        language="ru",
-                    )
-                    host_aud = np.concatenate((host_aud, pause, outputs_host["wav"]))
-
-            lector_aud = np.array([])
-            if "Лектор" in speech[0]:
-                for j in speech[1]:
-                    outputs_lector = model.synthesize(
-                        j,
-                        config,
-                        speaker_wav=self.wav_path,
-                        gpt_cond_len=5,
-                        language="ru",
-                    )
-                    lector_aud = np.concatenate(
-                        (lector_aud, pause, outputs_lector["wav"])
-                    )
-
-            fin_aud = np.concatenate((fin_aud, host_aud, lector_aud))
+        final_audio = np.array([])
+        for i in podcast_text.keys():
+            for speaker in podcast_text[i].keys():
+                if "presenter" in speaker:
+                    trans, presenter_speach = xtts_model(podcast_text[i]["presenter"], "../utils/podcast_host.wav")
+                if "lector" in speaker:
+                    trans, lector_speach = xtts_model(podcast_text[i]["lector"], self.clean_fragment)
+            final_audio = np.concatenate((final_audio, presenter_speach[0], lector_speach[0]))
 
         output_file_path = str(uuid.uuid4())
 
-        write(output_file_path + ".wav", 24000, fin_aud)
+        torchaudio.save(output_file_path + ".wav", torch.tensor(final_audio).unsqueeze(0), 24000)
 
         audio = AudioSegment.from_file(output_file_path + ".wav", format="wav")
 
@@ -540,3 +535,5 @@ class LectureHelper:
 
         os.remove(output_file_path + ".wav")
         os.remove(self.wav_path)
+        os.remove(self.clean_fragment)
+        self._clear_gpu_cache()
